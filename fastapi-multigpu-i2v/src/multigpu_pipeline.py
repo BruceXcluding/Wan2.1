@@ -102,7 +102,7 @@ class MultiGPUVideoPipeline:
             logger.info("Single GPU mode, skipping distributed initialization")
 
     def _load_model(self):
-        """加载分布式模型"""
+        """加载分布式模型 - 改进版本"""
         try:
             cfg = wan.configs.WAN_CONFIGS[self.model_args.get("task", "i2v-14B")]
             
@@ -110,7 +110,7 @@ class MultiGPUVideoPipeline:
             max_retries = 3
             for attempt in range(max_retries):
                 try:
-                    logger.info(f"Loading model attempt {attempt + 1}/{max_retries}")
+                    logger.info(f"Rank {self.rank}: Loading model attempt {attempt + 1}/{max_retries}")
                     
                     model = wan.WanI2V(
                         config=cfg,
@@ -120,27 +120,28 @@ class MultiGPUVideoPipeline:
                         t5_fsdp=self.model_args.get("t5_fsdp", False),
                         dit_fsdp=self.model_args.get("dit_fsdp", False),
                         use_usp=(self.model_args.get("ulysses_size", 1) > 1),
-                        t5_cpu=self.t5_cpu,  # 使用传入的参数
+                        t5_cpu=self.t5_cpu,
                         use_vae_parallel=self.model_args.get("vae_parallel", False),
                     )
                     
-                    # T5 CPU 模式下的特殊预热
+                    logger.info(f"Rank {self.rank}: Model loaded successfully")
+                    
+                    # 先同步模型加载完成
+                    if self.world_size > 1:
+                        logger.info(f"Rank {self.rank}: Waiting at model loading barrier")
+                        dist.barrier(timeout=timedelta(seconds=600))
+                        logger.info(f"Rank {self.rank}: Passed model loading barrier")
+                    
+                    # T5 CPU 模式下的预热（修复后的版本）
                     if self.t5_cpu:
-                        logger.info("T5 CPU mode: performing warmup")
+                        logger.info(f"Rank {self.rank}: Starting T5 CPU warmup process")
                         self._warmup_t5_cpu(model)
                     
-                    # 同步所有进程
-                    if self.world_size > 1:
-                        timeout_seconds = 900 if self.t5_cpu else 300
-                        logger.info(f"Rank {self.rank} waiting at model loading barrier (timeout: {timeout_seconds}s)")
-                        dist.barrier(timeout=timedelta(seconds=timeout_seconds))
-                        logger.info(f"Rank {self.rank} passed model loading barrier")
-                    
-                    logger.info(f"Model loaded successfully on rank {self.rank}")
+                    logger.info(f"Rank {self.rank}: All initialization completed")
                     return model
                     
                 except Exception as e:
-                    logger.warning(f"Model loading attempt {attempt + 1} failed: {str(e)}")
+                    logger.warning(f"Rank {self.rank}: Model loading attempt {attempt + 1} failed: {str(e)}")
                     if attempt == max_retries - 1:
                         raise
                     
@@ -149,29 +150,50 @@ class MultiGPUVideoPipeline:
                     time.sleep(10)
                     
         except Exception as e:
-            logger.error(f"Failed to load model: {str(e)}")
+            logger.error(f"Rank {self.rank}: Failed to load model: {str(e)}")
             raise
-
+        
     def _warmup_t5_cpu(self, model):
-        """T5 CPU 模式预热"""
+        """T5 CPU 模式预热 - 修复版本"""
         try:
-            logger.info(f"Rank {self.rank}: Warming up T5 on CPU")
-            
-            # 预热 T5 编码器
-            dummy_prompts = [
-                "warm up text",
-                "a simple test prompt for warmup",
-                "testing T5 encoder performance"
-            ]
-            
-            with torch.no_grad():
-                for prompt in dummy_prompts:
-                    _ = model.text_encoder([prompt], torch.device('cpu'))
-            
-            logger.info(f"Rank {self.rank}: T5 warmup completed successfully")
-            
+            # 只让 rank 0 进行 T5 预热，避免多进程竞争
+            if self.rank == 0:
+                logger.info(f"Rank {self.rank}: Warming up T5 on CPU")
+
+                # 预热 T5 编码器
+                dummy_prompts = [
+                    "warm up text",
+                    "a simple test prompt for warmup"
+                ]
+
+                with torch.no_grad():
+                    for i, prompt in enumerate(dummy_prompts):
+                        logger.info(f"Rank {self.rank}: T5 warmup step {i+1}/{len(dummy_prompts)}")
+                        try:
+                            _ = model.text_encoder([prompt], torch.device('cpu'))
+                            logger.info(f"Rank {self.rank}: T5 warmup step {i+1} completed")
+                        except Exception as e:
+                            logger.warning(f"Rank {self.rank}: T5 warmup step {i+1} failed: {str(e)}")
+                            break
+                        
+                logger.info(f"Rank {self.rank}: T5 warmup completed successfully")
+            else:
+                logger.info(f"Rank {self.rank}: Skipping T5 warmup (only rank 0 performs warmup)")
+
+            # 同步所有进程，等待 rank 0 完成预热
+            if self.world_size > 1:
+                logger.info(f"Rank {self.rank}: Waiting for T5 warmup synchronization")
+                dist.barrier(timeout=timedelta(seconds=300))  # 5分钟超时
+                logger.info(f"Rank {self.rank}: T5 warmup synchronization completed")
+
         except Exception as e:
-            logger.warning(f"T5 warmup failed: {str(e)}")
+            logger.warning(f"Rank {self.rank}: T5 warmup failed: {str(e)}")
+            # 即使预热失败也要尝试同步，避免其他进程永远等待
+            if self.world_size > 1:
+                try:
+                    dist.barrier(timeout=timedelta(seconds=60))
+                except Exception as sync_e:
+                    logger.error(f"Rank {self.rank}: Failed to sync after warmup failure: {str(sync_e)}")
 
     def _register_signal_handlers(self):
         """注册信号处理器"""
