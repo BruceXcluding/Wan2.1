@@ -7,6 +7,7 @@ import torch.distributed as dist
 import wan
 from wan.configs import MAX_AREA_CONFIGS
 from wan.utils.utils import cache_video
+from io import BytesIO
 from PIL import Image
 from pathlib import Path
 import os
@@ -89,26 +90,52 @@ class MultiGPUVideoPipeline:
             logger.error(f"Video generation failed for task {task_id}: {str(e)}")
             raise
 
+    # 在 _download_image 方法中添加更多错误处理
     async def _download_image(self, image_url: str, task_id: str) -> str:
         """异步下载图片"""
         output_dir = Path("generated_videos")
         output_dir.mkdir(exist_ok=True)
-        
+
         image_path = output_dir / f"{task_id}_input.jpg"
-        
+
         try:
-            async with aiohttp.ClientSession() as session:
+            # 添加超时和更多错误处理
+            timeout = aiohttp.ClientTimeout(total=30)  # 30秒超时
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(image_url) as response:
                     if response.status != 200:
                         raise Exception(f"Failed to download image: HTTP {response.status}")
-                    
+
+                    # 检查 Content-Type
+                    content_type = response.headers.get('Content-Type', '')
+                    if not content_type.startswith('image/'):
+                        logger.warning(f"Unexpected content type: {content_type}")
+
                     content = await response.read()
+
+                    # 检查文件大小
+                    if len(content) == 0:
+                        raise Exception("Downloaded image is empty")
+
+                    if len(content) > 50 * 1024 * 1024:  # 50MB 限制
+                        raise Exception("Image file too large (>50MB)")
+
                     image = Image.open(BytesIO(content)).convert("RGB")
-                    image.save(image_path)
-                    
+
+                    # 可选：调整图像大小以节省内存
+                    max_size = (2048, 2048)
+                    if image.size[0] > max_size[0] or image.size[1] > max_size[1]:
+                        image.thumbnail(max_size, Image.Resampling.LANCZOS)
+                        logger.info(f"Image resized to {image.size}")
+
+                    image.save(image_path, quality=95, optimize=True)
+
             logger.info(f"Image downloaded and saved: {image_path}")
             return str(image_path)
-            
+
+        except aiohttp.ClientError as e:
+            logger.error(f"HTTP client error downloading image for task {task_id}: {str(e)}")
+            raise Exception(f"Network error downloading image: {str(e)}")
         except Exception as e:
             logger.error(f"Failed to download image for task {task_id}: {str(e)}")
             raise
