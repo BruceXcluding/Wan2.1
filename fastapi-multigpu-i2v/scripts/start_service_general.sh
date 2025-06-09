@@ -29,6 +29,7 @@ export T5_FSDP="${T5_FSDP:-false}"
 export VAE_PARALLEL="${VAE_PARALLEL:-true}"
 export CFG_SIZE="${CFG_SIZE:-1}"
 export ULYSSES_SIZE="${ULYSSES_SIZE:-1}"
+export RING_SIZE="${RING_SIZE:-1}" 
 export USE_ATTENTION_CACHE="${USE_ATTENTION_CACHE:-false}"
 export CACHE_START_STEP="${CACHE_START_STEP:-12}"
 export CACHE_INTERVAL="${CACHE_INTERVAL:-4}"
@@ -76,6 +77,9 @@ echo "  - Model Path: $MODEL_CKPT_DIR"
 echo "  - T5 CPU Mode: $T5_CPU"
 echo "  - DIT FSDP: $DIT_FSDP"
 echo "  - VAE Parallel: $VAE_PARALLEL"
+echo "  - Ulysses Size: $ULYSSES_SIZE"
+echo "  - Ring Size: $RING_SIZE"
+echo "  - CFG Size: $CFG_SIZE"
 echo "  - Max Concurrent: $MAX_CONCURRENT_TASKS"
 echo "  - Timeout: ${TASK_TIMEOUT}s"
 echo "  - Server: $SERVER_HOST:$SERVER_PORT"
@@ -156,6 +160,47 @@ except Exception as e:
 IFS=':' read -r DEVICE_TYPE DEVICE_COUNT <<< "$DETECTED_DEVICE"
 
 echo -e "${GREEN}✅ Detected: $DEVICE_TYPE with $DEVICE_COUNT device(s)${NC}"
+
+# 🔧 添加：自动计算分布式推理参数
+if [ "$DEVICE_COUNT" -gt 1 ]; then
+    # 如果没有手动设置，则自动计算最优配置
+    if [ "$ULYSSES_SIZE" = "1" ] && [ "$RING_SIZE" = "1" ]; then
+        if [ "$DEVICE_COUNT" -le 8 ]; then
+            export ULYSSES_SIZE="$DEVICE_COUNT"
+            export RING_SIZE="1"
+        else
+            # 对于更大的设备数，进行因子分解
+            ULYSSES_SIZE=$(python3 -c "
+import math
+device_count = $DEVICE_COUNT
+ulysses_size = int(math.sqrt(device_count))
+for u in range(ulysses_size, 0, -1):
+    if device_count % u == 0:
+        print(u)
+        break
+else:
+    print(device_count)
+")
+            export RING_SIZE=$((DEVICE_COUNT / ULYSSES_SIZE))
+        fi
+        echo -e "${BLUE}🔗 Auto-calculated distributed config: Ulysses=${ULYSSES_SIZE}, Ring=${RING_SIZE}${NC}"
+    else
+        echo -e "${BLUE}🔗 Using manual distributed config: Ulysses=${ULYSSES_SIZE}, Ring=${RING_SIZE}${NC}"
+    fi
+    
+    # 验证配置
+    PRODUCT=$((ULYSSES_SIZE * RING_SIZE))
+    if [ "$PRODUCT" -ne "$DEVICE_COUNT" ]; then
+        echo -e "${YELLOW}⚠️  Warning: ulysses_size($ULYSSES_SIZE) * ring_size($RING_SIZE) = $PRODUCT != device_count($DEVICE_COUNT)${NC}"
+        echo -e "${YELLOW}   Adjusting to: ulysses_size=$DEVICE_COUNT, ring_size=1${NC}"
+        export ULYSSES_SIZE="$DEVICE_COUNT"
+        export RING_SIZE="1"
+    fi
+else
+    # 单设备强制设置为1
+    export ULYSSES_SIZE="1"
+    export RING_SIZE="1"
+fi
 
 # 设置设备相关环境变量
 if [ "$DEVICE_TYPE" = "npu" ]; then

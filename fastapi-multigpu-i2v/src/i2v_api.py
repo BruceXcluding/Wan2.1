@@ -383,7 +383,10 @@ async def lifespan(app: FastAPI):
                 'ckpt_dir': ckpt_dir,
                 't5_cpu': os.environ.get('T5_CPU', 'true').lower() == 'true',
                 'dit_fsdp': os.environ.get('DIT_FSDP', 'true').lower() == 'true',
-                'vae_parallel': os.environ.get('VAE_PARALLEL', 'true').lower() == 'true'
+                'vae_parallel': os.environ.get('VAE_PARALLEL', 'true').lower() == 'true',
+                'ulysses_size': int(os.environ.get('ULYSSES_SIZE', '1')),
+                'ring_size': int(os.environ.get('RING_SIZE', '1')),
+                'cfg_size': int(os.environ.get('CFG_SIZE', '1')),
             }
             
             pipeline = PipelineFactory.create_pipeline(**config)

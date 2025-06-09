@@ -40,34 +40,57 @@ class CUDAPipeline(BasePipeline):
         # CUDA特定的模型配置可以在这里添加
         pass
     
+
     def _generate_video_device_specific(self, request, img, size: str, frame_num: int):
-        """CUDA特定的视频生成"""
+        """CUDA特定的视频生成逻辑"""
         try:
-            from wan.configs import MAX_AREA_CONFIGS
+            logger.info(f"CUDA generating video: size={size}, frames={frame_num}")
             
-            # 调用模型生成
+            # 🔧 参数映射 - 严格按照 generate.py:428-437
+            generation_params = {
+                'max_area': self._calculate_max_area(size),      # 根据尺寸计算
+                'frame_num': frame_num,                          # 帧数
+                'shift': 3.0,                                    # i2v 默认 shift
+                'sample_solver': 'unipc',                        # 默认采样器
+                'sampling_steps': request.infer_steps or 40,     # 推理步数
+                'guide_scale': request.guidance_scale or 5.0,    # 引导系数
+                'seed': request.seed or self._generate_seed(),   # 随机种子
+                'offload_model': self.world_size > 4             # 多卡时启用卸载
+            }
+            
+            logger.info(f"CUDA generation params: {generation_params}")
+            
+            # 调用模型生成 - 与 generate.py:428-437 完全一致
             video_tensor = self.model.generate(
-                request.prompt,
-                img,
-                max_area=MAX_AREA_CONFIGS[size],
-                frame_num=frame_num,
-                shift=getattr(request, 'sample_shift', 5.0),
-                sample_solver=getattr(request, 'sample_solver', 'unipc'),
-                sampling_steps=request.infer_steps or 30,
-                guide_scale=request.guidance_scale or 3.0,
-                n_prompt=getattr(request, 'negative_prompt', ""),
-                seed=getattr(request, 'seed', None)
+                request.prompt,  # 第一个参数：提示词
+                img,            # 第二个参数：PIL.Image 对象
+                **generation_params  # 其余参数
             )
             
-            return video_tensor
-            
-        except Exception as e:
-            if "out of memory" in str(e).lower():
-                logger.error(f"CUDA out of memory on rank {self.rank}: {str(e)}")
-                torch.cuda.empty_cache()
-                raise Exception(f"GPU 显存不足，请降低并发数或帧数: {str(e)}")
+            if self.rank == 0:
+                return video_tensor
             else:
-                raise
+                return None
+                
+        except Exception as e:
+            logger.error(f"CUDA video generation failed: {str(e)}")
+            raise
+        
+def _calculate_max_area(self, size: str) -> int:
+    """根据尺寸字符串计算 max_area"""
+    try:
+        if '*' in size:
+            width, height = map(int, size.split('*'))
+            return width * height
+        else:
+            return 921600  # 1280*720
+    except:
+        return 921600
+
+def _generate_seed(self) -> int:
+    """生成随机种子"""
+    import random
+    return random.randint(0, 2**32 - 1)
     
     def _log_memory_usage(self):
         """记录CUDA内存使用"""

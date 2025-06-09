@@ -151,6 +151,8 @@ class PipelineFactory:
         
         return True
     
+    # 修正分布式参数计算逻辑
+    
     @staticmethod
     def get_optimal_config(device_info: Dict[str, Any] = None) -> Dict[str, Any]:
         """根据设备信息生成最优配置"""
@@ -163,35 +165,77 @@ class PipelineFactory:
         # 基础配置
         config = {
             "device_type": device_type,
-            "device_count": device_count
+            "device_count": device_count,
+            "task": "i2v-14B",
         }
         
-        # 根据设备类型和数量调整配置
+        # 计算分布式推理参数 - 参照 generate.py 的逻辑
+        if device_count > 1:
+            ulysses_size, ring_size = PipelineFactory._calculate_optimal_parallel_config(device_count)
+            
+            # 验证配置 - 参照 generate.py:334
+            assert ulysses_size * ring_size == device_count, \
+                f"ulysses_size({ulysses_size}) * ring_size({ring_size}) != device_count({device_count})"
+        else:
+            ulysses_size = 1
+            ring_size = 1
+        
+        # 根据设备类型调整配置
         if device_type == "npu":
             config.update({
-                "t5_cpu": True,  # NPU 通常使用 T5 CPU 模式
+                "t5_cpu": True,
                 "dit_fsdp": True,
-                "vae_parallel": device_count > 1,
-                "ulysses_size": min(8, device_count) if device_count > 4 else 1
+                "t5_fsdp": False,
+                "init_on_cpu": True,
+                "ulysses_size": ulysses_size,
+                "ring_size": ring_size,
             })
         elif device_type == "cuda":
             config.update({
-                "t5_cpu": False,  # CUDA 可以使用 T5 GPU 模式
+                "t5_cpu": device_count > 4,
                 "dit_fsdp": True,
-                "vae_parallel": device_count > 1,
-                "ulysses_size": min(4, device_count) if device_count > 2 else 1
+                "t5_fsdp": False,
+                "init_on_cpu": True,
+                "ulysses_size": ulysses_size,
+                "ring_size": ring_size,
             })
         else:
             # CPU 配置
             config.update({
                 "t5_cpu": True,
                 "dit_fsdp": False,
-                "vae_parallel": False,
-                "ulysses_size": 1
+                "t5_fsdp": False,
+                "init_on_cpu": True,
+                "ulysses_size": 1,
+                "ring_size": 1,
             })
         
         return config
-
+    
+    @staticmethod
+    def _calculate_optimal_parallel_config(device_count: int) -> tuple:
+        """计算最优的并行配置"""
+        if device_count == 1:
+            return 1, 1
+        
+        # 对于 NPU (昇腾)，通常优先使用序列并行
+        # 对于小规模设备，全部用 ulysses 并行
+        if device_count <= 8:
+            return device_count, 1
+        
+        # 对于大规模设备，寻找平衡的因子分解
+        import math
+        sqrt_count = int(math.sqrt(device_count))
+        
+        # 寻找最接近平方根的因子，优先较大的 ulysses_size
+        for ulysses_size in range(sqrt_count, 0, -1):
+            if device_count % ulysses_size == 0:
+                ring_size = device_count // ulysses_size
+                return ulysses_size, ring_size
+        
+        # 如果没有找到平衡的分解，回退到全 ulysses
+        return device_count, 1
+        
 def get_available_pipelines() -> list:
     """获取可用的管道类型"""
     try:

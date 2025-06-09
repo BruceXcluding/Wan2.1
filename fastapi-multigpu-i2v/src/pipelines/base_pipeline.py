@@ -109,8 +109,8 @@ class ModelLoaderMixin:
 
             # 添加 wan 模块路径
             current_file = Path(__file__).resolve()
-            project_root = current_file.parent.parent.parent  # src/pipelines/ -> src/ -> project_root/
-            wan_project_root = project_root.parent  # 上一级目录，即 /workspace/Wan2.1
+            project_root = current_file.parent.parent.parent
+            wan_project_root = project_root.parent
 
             if str(wan_project_root) not in sys.path:
                 sys.path.insert(0, str(wan_project_root))
@@ -123,53 +123,111 @@ class ModelLoaderMixin:
             # 获取配置
             cfg = wan.configs.WAN_CONFIGS[model_config.get("task", "i2v-14B")]
 
+            # 获取分布式参数
+            ulysses_size = model_config.get('ulysses_size', 1)
+            ring_size = model_config.get('ring_size', 1)
+            use_usp = ulysses_size > 1 or ring_size > 1
+
+            logger.info(f"Distributed params: ulysses_size={ulysses_size}, ring_size={ring_size}, use_usp={use_usp}")
+
+            # 分布式环境验证和初始化 (参照 generate.py:333-346)
+            world_size = getattr(self, 'world_size', 1)
+            rank = getattr(self, 'rank', 0)
+
+            if world_size > 1:
+                if use_usp:
+                    # 验证参数 (generate.py:334)
+                    assert ulysses_size * ring_size == world_size, \
+                        f"ulysses_size({ulysses_size}) * ring_size({ring_size}) != world_size({world_size})"
+
+                    # 验证注意力头数兼容性 (generate.py:359)
+                    if ulysses_size > 1:
+                        assert cfg.num_heads % ulysses_size == 0, \
+                            f"`{cfg.num_heads=}` cannot be divided evenly by `{ulysses_size=}`."
+
+                    try:
+                        # 初始化 xfuser 分布式环境 (generate.py:335-346)
+                        import torch.distributed as dist
+                        from xfuser.core.distributed import (
+                            init_distributed_environment,
+                            initialize_model_parallel,
+                        )
+
+                        if dist.is_initialized():
+                            logger.info(f"Initializing xfuser: ulysses_size={ulysses_size}, ring_size={ring_size}")
+
+                            init_distributed_environment(
+                                rank=dist.get_rank(), 
+                                world_size=dist.get_world_size()
+                            )
+
+                            initialize_model_parallel(
+                                sequence_parallel_degree=dist.get_world_size(),
+                                ring_degree=ring_size,
+                                ulysses_degree=ulysses_size,
+                            )
+
+                            logger.info("✅ xfuser initialized successfully")
+                        else:
+                            logger.warning("PyTorch distributed not initialized, disabling USP")
+                            use_usp = False
+
+                    except ImportError as e:
+                        logger.warning(f"xfuser not available: {e}, disabling USP")
+                        use_usp = False
+                    except Exception as e:
+                        logger.warning(f"xfuser initialization failed: {e}, disabling USP") 
+                        use_usp = False
+            else:
+                # 单进程环境验证 (generate.py:327-332)
+                assert not (model_config.get('t5_fsdp', False) or model_config.get('dit_fsdp', False)), \
+                    "t5_fsdp and dit_fsdp are not supported in non-distributed environments."
+                assert not use_usp, \
+                    "context parallel are not supported in non-distributed environments."
+
             max_retries = 3
             for attempt in range(max_retries):
                 try:
-                    logger.info(f"Rank {self.rank}: Loading {self.device_type} model attempt {attempt + 1}/{max_retries}")
+                    logger.info(f"Rank {rank}: Loading {self.device_type} model attempt {attempt + 1}/{max_retries}")
 
-                    model = wan.WanI2V(
-                        config=cfg,
-                        checkpoint_dir=self.ckpt_dir,
-                        device_id=self.local_rank,
-                        rank=self.rank,
-                        **model_config
-                    )
+                    # 构建 WanI2V 参数 - 严格按照 generate.py:421-425 的方式
+                    wan_config = {
+                        'config': cfg,
+                        'checkpoint_dir': self.ckpt_dir,
+                        'device_id': getattr(self, 'local_rank', 0),
+                        'rank': rank,
+                        't5_fsdp': model_config.get('t5_fsdp', False),
+                        'dit_fsdp': model_config.get('dit_fsdp', True),
+                        'use_usp': use_usp,  # 这个是关键参数
+                        't5_cpu': model_config.get('t5_cpu', True),
+                    }
+
+                    logger.info(f"Creating WanI2V with config: {list(wan_config.keys())}")
+                    logger.info(f"Final distributed config: use_usp={use_usp}")
+
+                    # 创建 WanI2V 模型
+                    model = wan.WanI2V(**wan_config)
 
                     # 设备特定的模型配置
                     self._configure_model(model)
 
-                    # T5 CPU模式预热
-                    if self.t5_cpu:
-                        self._warmup_t5_cpu(model)
-
-                    logger.info(f"Rank {self.rank}: {self.device_type} model loaded successfully")
+                    logger.info(f"Rank {rank}: {self.device_type} model loaded successfully")
                     return model
 
                 except Exception as e:
-                    logger.warning(f"Rank {self.rank}: Model loading attempt {attempt + 1} failed: {str(e)}")
+                    logger.warning(f"Rank {rank}: Model loading attempt {attempt + 1} failed: {str(e)}")
                     if attempt == max_retries - 1:
                         raise
                     
-                    time.sleep(5 * (attempt + 1))  # 递增延迟
+                    time.sleep(5 * (attempt + 1))
 
         except ImportError as e:
             logger.error(f"❌ Failed to import wan module: {e}")
-            logger.info(f"wan project root: {wan_project_root}")
-            logger.info(f"wan directory exists: {(wan_project_root / 'wan').exists()}")
-
-            # 列出可用的目录
-            if wan_project_root.exists():
-                logger.info("Available directories in wan project root:")
-                for item in wan_project_root.iterdir():
-                    if item.is_dir():
-                        logger.info(f"  - {item.name}")
-
             raise
         except Exception as e:
             logger.error(f"Failed to load {self.device_type} model: {str(e)}")
             raise
-        
+
     def _warmup_t5_cpu(self, model):
         """T5 CPU模式预热"""
         if not self.t5_cpu:
@@ -222,8 +280,13 @@ class VideoGenerationMixin:
                 dist.barrier()
                 logger.info(f"Rank {self.rank} passed {self.device_type} generation sync barrier")
             
-            # 调用设备特定的生成方法
-            video_tensor = self._generate_video_device_specific(request, img, size, frame_num)
+            # 🔧 关键修改：传递正确的参数给设备特定的生成方法
+            video_tensor = self._generate_video_device_specific(
+                request, 
+                img, 
+                size, 
+                frame_num
+            )
             
             # 保存视频
             if video_tensor is not None:
@@ -248,7 +311,7 @@ class VideoGenerationMixin:
             logger.error(f"{self.device_type} video generation failed: {str(e)}")
             self._empty_cache()
             raise
-    
+        
     def _save_video(self, video_tensor, output_path: str, frame_num: int):
         """保存视频"""
         try:
