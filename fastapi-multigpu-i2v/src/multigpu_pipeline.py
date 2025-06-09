@@ -159,15 +159,19 @@ class MultiGPUVideoPipeline:
             # 处理参数
             size = self._normalize_size(request.image_size)
             img = Image.open(image_path).convert("RGB")
-            
-            logger.info(f"Generating video with size={size}, frames={request.num_frames}")
+
+            # 验证和调整帧数
+            frame_num = self._validate_frame_num(request.num_frames)
+        
+            logger.info(f"Generating video with size={size}, frames={frame_num}")
+            logger.info(f"Image size: {img.size}, max_area: {MAX_AREA_CONFIGS.get(size, 'Unknown')}")    
             
             # 调用模型生成
             video_tensor = self.model.generate(
                 request.prompt,
                 img,
                 max_area=MAX_AREA_CONFIGS[size],
-                frame_num=request.num_frames,
+                frame_num=frame_num,
                 shift=getattr(request, 'sample_shift', 5.0),
                 sample_solver=getattr(request, 'sample_solver', 'unipc'),
                 sampling_steps=request.infer_steps,
@@ -179,7 +183,8 @@ class MultiGPUVideoPipeline:
             
             # 保存视频（只有 rank 0 会有数据）
             if video_tensor is not None:
-                self._save_video(video_tensor, output_path, request.num_frames)
+                logger.info(f"Generated video tensor shape: {video_tensor.shape}")
+                self._save_video(video_tensor, output_path, request.frame_num)
                 logger.info(f"Video saved to {output_path}")
             else:
                 logger.info(f"Non-master rank {self.rank}, video not saved")
@@ -188,12 +193,34 @@ class MultiGPUVideoPipeline:
             
         except Exception as e:
             logger.error(f"Sync generation failed for task {task_id}: {str(e)}")
+            import traceback
+            logger.error(f"Full traceback:\n{traceback.format_exc()}")
             raise
+
+    def _validate_frame_num(self, frame_num: int) -> int:
+        """验证和调整帧数"""
+        # Wan2.1 模型通常要求帧数是特定倍数
+        # 常见的有效帧数: 41, 61, 81, 121 等
+        valid_frames = [41, 61, 81, 121]
+
+        if frame_num in valid_frames:
+            return frame_num
+
+        # 找到最接近的有效帧数
+        closest_frame = min(valid_frames, key=lambda x: abs(x - frame_num))
+        logger.warning(f"Frame number {frame_num} adjusted to {closest_frame}")
+        return closest_frame
 
     def _normalize_size(self, size: str) -> str:
         """标准化尺寸参数"""
         if size == "auto":
             return "1280*720"
+
+        # 验证尺寸是否在支持列表中
+        if size not in MAX_AREA_CONFIGS:
+            logger.warning(f"Size {size} not in MAX_AREA_CONFIGS, using 1280*720")
+            return "1280*720"
+
         return size
 
     def _save_video(self, video_tensor, output_path: str, frame_num: int):

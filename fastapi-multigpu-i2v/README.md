@@ -10,6 +10,8 @@
 - **⚡ 性能优化**：注意力缓存、VAE并行等多种加速技术
 - **📊 任务管理**：完整的任务状态跟踪和队列管理
 - **🛡️ 容错机制**：健壮的错误处理和资源清理
+- **🔒 企业级安全**：资源限制、并发控制、异常处理
+- **📈 监控运维**：详细指标、健康检查、自动清理
 
 ## 📁 项目结构
 
@@ -55,6 +57,18 @@ export TOKENIZERS_PARALLELISM=false
 # 分布式通信配置
 export MASTER_ADDR=127.0.0.1
 export MASTER_PORT=29500
+
+# 服务配置（可选）
+export SERVER_HOST=0.0.0.0
+export SERVER_PORT=8088
+export MAX_CONCURRENT_TASKS=5
+export TASK_TIMEOUT=1800
+export CLEANUP_INTERVAL=300
+export MAX_OUTPUT_DIR_SIZE=50
+export ALLOWED_HOSTS="*"
+
+# 模型配置（可选）
+export MODEL_CKPT_DIR="/data/models/modelscope/hub/Wan-AI/Wan2.1-I2V-14B-720P"
 ```
 
 ### 2. 依赖安装
@@ -71,7 +85,7 @@ python -c "import torch_npu; print(torch_npu.__version__)"
 
 确保模型文件位于指定路径：
 ```
-Wan-AI/Wan2.1-I2V-14B-720P/
+/data/models/modelscope/hub/Wan-AI/Wan2.1-I2V-14B-720P/
 ├── config.json
 ├── model.safetensors
 └── ...
@@ -91,6 +105,7 @@ torchrun --nproc_per_node=8 src/i2v_api.py
 - **API 服务**：http://localhost:8088
 - **API 文档**：http://localhost:8088/docs
 - **健康检查**：http://localhost:8088/health
+- **监控指标**：http://localhost:8088/metrics
 
 ## 📚 API 接口文档
 
@@ -102,6 +117,7 @@ torchrun --nproc_per_node=8 src/i2v_api.py
 | `/video/status` | POST | 查询任务状态 | 200 |
 | `/video/cancel` | POST | 取消任务 | 200 |
 | `/health` | GET | 服务健康检查 | 200 |
+| `/metrics` | GET | 获取详细指标 | 200 |
 | `/docs` | GET | API 文档 | 200 |
 
 ### 1. 🎬 提交视频生成任务
@@ -141,6 +157,21 @@ torchrun --nproc_per_node=8 src/i2v_api.py
 ```json
 {
   "requestId": "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6"
+}
+```
+
+#### 错误响应
+
+```json
+{
+  "error": "VALIDATION_ERROR",
+  "message": "参数验证失败的具体信息"
+}
+```
+
+```json
+{
+  "detail": "服务器繁忙，请稍后重试"  // 429 状态码
 }
 ```
 
@@ -203,7 +234,73 @@ torchrun --nproc_per_node=8 src/i2v_api.py
 }
 ```
 
-## 🎛️ 参数配置
+### 4. 🏥 健康检查
+
+**GET** `/health`
+
+#### 响应
+
+```json
+{
+  "status": "healthy",
+  "timestamp": 1703847600.123,
+  "uptime": 3600.5,
+  "rank": 0,
+  "world_size": 8,
+  "service": {
+    "total_tasks": 15,
+    "pipeline_world_size": 8,
+    "pipeline_rank": 0
+  },
+  "resources": {
+    "concurrent_tasks": 2,
+    "max_concurrent": 5,
+    "available_slots": 3
+  }
+}
+```
+
+### 5. 📈 监控指标
+
+**GET** `/metrics`
+
+#### 响应
+
+```json
+{
+  "timestamp": 1703847600.123,
+  "service": {
+    "total_tasks": 15,
+    "pipeline_world_size": 8,
+    "pipeline_rank": 0
+  },
+  "resources": {
+    "concurrent_tasks": 2,
+    "max_concurrent": 5,
+    "available_slots": 3
+  },
+  "system": {
+    "rank": 0,
+    "world_size": 8,
+    "uptime": 3600.5
+  }
+}
+```
+
+## 🎛️ 配置参数
+
+### 环境变量配置
+
+| 变量名 | 默认值 | 说明 |
+|--------|--------|------|
+| `SERVER_HOST` | 0.0.0.0 | 服务监听地址 |
+| `SERVER_PORT` | 8088 | 服务端口 |
+| `MAX_CONCURRENT_TASKS` | 5 | 最大并发任务数 |
+| `TASK_TIMEOUT` | 1800 | 任务超时时间(秒) |
+| `CLEANUP_INTERVAL` | 300 | 清理间隔(秒) |
+| `MAX_OUTPUT_DIR_SIZE` | 50 | 最大输出目录大小(GB) |
+| `ALLOWED_HOSTS` | * | 允许的主机列表 |
+| `MODEL_CKPT_DIR` | /data/models/... | 模型文件路径 |
 
 ### 基础参数
 
@@ -259,6 +356,12 @@ curl -X POST "http://localhost:8088/video/submit" \
 curl -X POST "http://localhost:8088/video/status" \
 -H "Content-Type: application/json" \
 -d '{"requestId": "your-task-id-here"}'
+
+# 检查服务健康状态
+curl "http://localhost:8088/health"
+
+# 获取监控指标
+curl "http://localhost:8088/metrics"
 ```
 
 ### Python 客户端示例
@@ -276,6 +379,10 @@ response = requests.post("http://localhost:8088/video/submit", json={
     "ulysses_size": 8,
     "use_attentioncache": True
 })
+
+if response.status_code == 429:
+    print("服务器繁忙，请稍后重试")
+    exit()
 
 task_id = response.json()["requestId"]
 print(f"Task submitted: {task_id}")
@@ -298,6 +405,33 @@ while True:
     time.sleep(5)
 ```
 
+### 错误处理示例
+
+```python
+import requests
+
+try:
+    response = requests.post("http://localhost:8088/video/submit", json={
+        "prompt": "test",  # 太短，会触发验证错误
+        "image_url": "invalid-url"
+    })
+    
+    if response.status_code == 400:
+        error_data = response.json()
+        print(f"参数错误: {error_data['error']} - {error_data['message']}")
+    elif response.status_code == 429:
+        print("服务器繁忙，请稍后重试")
+    elif response.status_code == 500:
+        error_data = response.json()
+        print(f"服务器错误: {error_data['error']} - {error_data['message']}")
+    else:
+        task_id = response.json()["requestId"]
+        print(f"任务提交成功: {task_id}")
+
+except requests.RequestException as e:
+    print(f"网络错误: {str(e)}")
+```
+
 ## 🏗️ 架构设计
 
 ### 分布式架构
@@ -307,6 +441,7 @@ while True:
 │   Rank 0 (主)   │    │   Rank 1-7      │    │   客户端请求     │
 │  FastAPI 服务   │◄───┤   分布式推理     │◄───┤   HTTP API      │
 │  任务管理       │    │   模型分片       │    │   WebSocket     │
+│  资源控制       │    │                 │    │                 │
 └─────────────────┘    └─────────────────┘    └─────────────────┘
          │                        │
          └────────┬─────────────────┘
@@ -323,6 +458,8 @@ while True:
 HTTP 请求 → API 层 → 服务层 → 管道层 → 分布式模型 → 视频生成 → 文件保存 → HTTP 响应
    ↓           ↓        ↓        ↓          ↓          ↓          ↓          ↓
 i2v_api.py → video_service.py → multigpu_pipeline.py → WanI2V → cache_video → 静态文件服务
+   ↓
+资源管理 → 并发控制 → 异常处理 → 监控记录
 ```
 
 ## ⚡ 性能特性
@@ -340,18 +477,37 @@ i2v_api.py → video_service.py → multigpu_pipeline.py → WanI2V → cache_vi
 - **混合精度**：自动混合精度训练，提升计算效率
 - **异步处理**：异步 I/O 和任务队列，提升并发能力
 
+### 资源管理
+
+- **并发控制**：限制同时处理的任务数量，防止资源耗尽
+- **内存管理**：自动清理过期任务和临时文件
+- **负载均衡**：智能任务调度，充分利用硬件资源
+
 ### 预期性能
 
-| 配置 | 分辨率 | 帧数 | 生成时间 | 显存占用 |
-|------|--------|------|----------|----------|
-| 8卡 NPU | 1280×720 | 81帧 | ~2-3分钟 | ~20GB |
-| 8卡 NPU | 1280×720 | 121帧 | ~3-4分钟 | ~25GB |
+| 配置 | 分辨率 | 帧数 | 生成时间 | 显存占用 | 并发数 |
+|------|--------|------|----------|----------|--------|
+| 8卡 NPU | 1280×720 | 81帧 | ~2-3分钟 | ~20GB | 1-5 |
+| 8卡 NPU | 1280×720 | 121帧 | ~3-4分钟 | ~25GB | 1-3 |
 
 ## 🛠️ 故障排除
 
 ### 常见问题
 
-#### 1. HCCL 初始化失败
+#### 1. 服务启动失败
+
+```bash
+# 症状：ImportError 或模块不存在
+# 解决方案：
+export PYTHONPATH=/path/to/your/project:$PYTHONPATH
+pip install -r requirements.txt
+
+# 症状：端口被占用
+# 解决方案：
+export SERVER_PORT=8089  # 使用其他端口
+```
+
+#### 2. HCCL 初始化失败
 
 ```bash
 # 症状：RuntimeError: HCCL init failed
@@ -361,31 +517,32 @@ sleep 10
 torchrun --nproc_per_node=8 src/i2v_api.py
 ```
 
-#### 2. 端口冲突
+#### 3. 任务提交被拒绝
 
 ```bash
-# 检查端口占用
-lsof -i :8088
-# 杀掉占用进程
-kill -9 $(lsof -t -i:8088)
+# 症状：HTTP 429 "服务器繁忙"
+# 原因：并发任务数超过限制
+# 解决方案：
+export MAX_CONCURRENT_TASKS=10  # 增加并发限制
+# 或等待当前任务完成
 ```
 
-#### 3. NPU 内存不足
+#### 4. NPU 内存不足
 
 ```bash
 # 检查 NPU 状态
 npu-smi info
 # 清理 NPU 缓存
 python -c "import torch_npu; torch_npu.npu.empty_cache()"
+# 调整并发数
+export MAX_CONCURRENT_TASKS=2
 ```
 
-#### 4. 模型文件缺失
+#### 5. 任务失败常见原因
 
-```bash
-# 检查模型文件
-ls -la /data/models/modelscope/hub/Wan-AI/Wan2.1-I2V-14B-720P/
-# 重新下载模型（如果需要）
-```
+- **图像下载失败**：检查 `image_url` 是否可访问
+- **参数验证失败**：检查帧数、分辨率等参数范围
+- **模型文件缺失**：确认 `MODEL_CKPT_DIR` 路径正确
 
 ### 日志调试
 
@@ -395,8 +552,11 @@ export PYTHONPATH=/path/to/your/project
 export NCCL_DEBUG=INFO
 torchrun --nproc_per_node=8 src/i2v_api.py
 
-# 查看任务日志
-tail -f logs/video_generation.log
+# 查看实时日志
+tail -f /var/log/video_generation.log
+
+# 查看错误日志
+grep ERROR /var/log/video_generation.log
 ```
 
 ## 📊 监控和维护
@@ -404,35 +564,81 @@ tail -f logs/video_generation.log
 ### 健康检查
 
 ```bash
-# 检查服务状态
+# 基础健康检查
 curl http://localhost:8088/health
+
+# 详细监控指标
+curl http://localhost:8088/metrics
 
 # 响应示例
 {
   "status": "healthy",
+  "timestamp": 1703847600.123,
+  "uptime": 3600.5,
   "rank": 0,
-  "total_tasks": 5,
-  "pipeline_world_size": 8,
-  "pipeline_rank": 0
+  "world_size": 8,
+  "service": {
+    "total_tasks": 15,
+    "pipeline_world_size": 8,
+    "pipeline_rank": 0
+  },
+  "resources": {
+    "concurrent_tasks": 2,
+    "max_concurrent": 5,
+    "available_slots": 3
+  }
 }
 ```
 
-### 任务清理
+### 自动清理
 
-服务会自动清理过期任务（默认1小时），也可以手动触发：
+服务会自动执行以下清理任务：
 
-```python
-# 通过内部 API 清理
-import requests
-requests.post("http://localhost:8088/admin/cleanup")  # 需要实现
+- **过期任务清理**：每5分钟清理超过30分钟的已完成任务
+- **视频文件清理**：当存储超过50GB时自动删除最旧的文件
+- **资源释放**：任务完成后自动释放并发槽位
+
+### 手动维护
+
+```bash
+# 重启服务
+ps aux | grep i2v_api | awk '{print $2}' | xargs kill -15
+sleep 5
+torchrun --nproc_per_node=8 src/i2v_api.py
+
+# 清理生成的视频文件
+find generated_videos -type f -mtime +7 -delete
+
+# 检查磁盘使用
+du -sh generated_videos/
 ```
 
 ## 🔒 安全注意事项
 
-- **输入验证**：严格验证图像 URL 和提示词
-- **资源限制**：限制并发任务数量和视频长度
-- **访问控制**：生产环境建议添加认证机制
-- **文件清理**：定期清理生成的视频文件
+### 生产环境配置
+
+```bash
+# 限制允许的主机
+export ALLOWED_HOSTS="api.example.com,*.example.com"
+
+# 调整资源限制
+export MAX_CONCURRENT_TASKS=3
+export TASK_TIMEOUT=900  # 15分钟超时
+
+# 设置安全的文件权限
+chmod 750 generated_videos/
+```
+
+### 安全检查清单
+
+- ✅ **输入验证**：严格验证图像 URL 和提示词
+- ✅ **资源限制**：限制并发任务数量和视频长度
+- ✅ **访问控制**：配置允许的主机列表
+- ✅ **文件清理**：定期清理生成的视频文件
+- ✅ **错误处理**：不暴露内部错误信息
+- ⚠️ **认证机制**：生产环境建议添加 API Key 或 OAuth
+- ⚠️ **HTTPS**：生产环境使用 HTTPS 加密传输
+- ⚠️ **防火墙**：限制服务端口的网络访问
 
 ## 📋 依赖清单
 
@@ -469,4 +675,4 @@ Pillow>=10.0.0
 
 ---
 
-**📞 技术支持**：如有问题，请提交 [Issue](https://github.com/your-repo/issues) 或联系维护团队。
+**📞 技术支持**：如有问题，请提交 [Issue](https://github.com/BruceXcluding/Wan2.1/issues) 或联系维护团队。
