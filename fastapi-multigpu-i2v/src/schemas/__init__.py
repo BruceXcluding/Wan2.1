@@ -2,25 +2,22 @@
 数据模型包
 """
 
-# 使用绝对导入
-from schemas.video import (
+from .video import (
+    TaskStatus,
     VideoSubmitRequest,
     VideoSubmitResponse,
-    VideoStatusRequest,
+    VideoStatusRequest, 
     VideoStatusResponse,
     VideoCancelRequest,
     VideoCancelResponse,
     VideoResults,
-    ErrorResponse,
     HealthResponse,
     MetricsResponse,
-    DeviceInfoResponse,
-    TaskStatus,
-    QualityPreset,
-    SampleSolver
+    ErrorResponse
 )
 
 __all__ = [
+    "TaskStatus",
     "VideoSubmitRequest",
     "VideoSubmitResponse", 
     "VideoStatusRequest",
@@ -28,11 +25,9 @@ __all__ = [
     "VideoCancelRequest",
     "VideoCancelResponse",
     "VideoResults",
-    "ErrorResponse",
     "HealthResponse",
     "MetricsResponse",
-    "DeviceInfoResponse",
-    "TaskStatus",
-    "QualityPreset",
-    "SampleSolver"
+    "ErrorResponse"
 ]
+
+__version__ = "1.0.0"

@@ -1,37 +1,93 @@
+#!/usr/bin/env python3
 """
-视频生成服务
-负责管理视频生成任务的生命周期
+FastAPI Multi-GPU I2V API Server
+完整的分布式视频生成服务
 """
-import asyncio
+import os
+import sys
 import time
-import uuid
 import logging
-from typing import Dict, Any, Optional, List
+import asyncio
+import uuid
 from datetime import datetime
+from typing import Dict, Any, Optional, List
+from contextlib import asynccontextmanager
+import traceback
 
-# 修复导入 - 使用绝对导入
-from schemas.video import (
-    VideoSubmitRequest,
-    VideoStatusResponse,
-    VideoResults,
-    TaskStatus
-)
+# 添加项目路径到 Python path
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
-logger = logging.getLogger(__name__)
+# 分布式环境变量
+rank = int(os.environ.get('RANK', 0))
+world_size = int(os.environ.get('WORLD_SIZE', 1))
+local_rank = int(os.environ.get('LOCAL_RANK', 0))
+
+print(f"🚀 I2V API Server - Rank {rank}/{world_size}")
+
+try:
+    # 配置日志
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    logger = logging.getLogger(__name__)
+    
+    # 核心导入
+    import torch
+    import torch.distributed as dist
+    import uvicorn
+    from fastapi import FastAPI, HTTPException, Request
+    from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.staticfiles import StaticFiles
+    from fastapi.responses import JSONResponse
+    
+    # 项目模块导入 - 正确的导入方式
+    from schemas import (
+        VideoSubmitRequest,
+        VideoSubmitResponse,
+        VideoStatusRequest,
+        VideoStatusResponse,
+        VideoCancelRequest,
+        VideoCancelResponse,
+        TaskStatus,
+        VideoResults,
+        HealthResponse,
+        MetricsResponse
+    )
+    
+    from pipelines import PipelineFactory, get_available_pipelines
+    from utils import device_detector  # 注意这是外层的utils
+    
+    print("✅ All modules imported successfully")
+    print(f"📦 Available pipelines: {get_available_pipelines()}")
+    
+except Exception as e:
+    print(f"❌ Import failed: {e}")
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)
+
+# ... 其余代码保持不变 ...
+
+# 全局变量
+pipeline = None
+startup_time = time.time()
+service_stats = {
+    'total_tasks': 0,
+    'successful_tasks': 0,
+    'failed_tasks': 0,
+    'cancelled_tasks': 0
+}
 
 class VideoService:
     """视频生成服务"""
     
-    def __init__(self, pipeline):
-        self.pipeline = pipeline
+    def __init__(self, pipeline_instance):
+        self.pipeline = pipeline_instance
         self.tasks: Dict[str, Dict[str, Any]] = {}
         self.task_lock = asyncio.Lock()
-        
-        # 统计信息
-        self.total_tasks = 0
-        self.successful_tasks = 0
-        self.failed_tasks = 0
-        self.cancelled_tasks = 0
         
         logger.info("VideoService initialized")
     
@@ -51,12 +107,11 @@ class VideoService:
                 "request_params": request.model_dump(),
                 "results": None,
                 "reason": None,
-                "elapsed_time": None,
-                "queue_position": len([t for t in self.tasks.values() if t["status"] == TaskStatus.PENDING])
+                "elapsed_time": None
             }
             
             self.tasks[task_id] = task_data
-            self.total_tasks += 1
+            service_stats['total_tasks'] += 1
         
         # 异步启动任务
         asyncio.create_task(self._process_video_task(task_id, request))
@@ -77,32 +132,30 @@ class VideoService:
                 "Starting video generation..."
             )
             
-            # 准备参数
-            generation_params = self._prepare_generation_params(request)
+            # 进度回调函数
+            async def progress_callback(progress: int, total: int, message: str = ""):
+                await self._update_task_status(task_id, TaskStatus.RUNNING, progress, message)
             
-            # 更新进度
-            await self._update_task_status(
-                task_id, 
-                TaskStatus.RUNNING, 
-                20, 
-                "Initializing models..."
-            )
-            
-            # 调用管道生成视频
+            # 调用管道生成视频 - 修复调用方式
             logger.info(f"Starting video generation for task {task_id}")
-            result = await self._generate_video_with_pipeline(task_id, generation_params)
+            
+            # 使用正确的管道调用方式
+            result_path = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.pipeline.generate_video(request, task_id, progress_callback)
+            )
             
             # 生成成功
             elapsed_time = int(time.time() - start_time)
             
             # 创建结果对象
             video_results = VideoResults(
-                video_url=f"http://localhost:8088/videos/{result['filename']}",
-                video_path=result['output_path'],
-                duration=result.get('duration', 3.4),
-                frames=generation_params['num_frames'],
-                size=generation_params['image_size'],
-                file_size=result.get('file_size', 0)
+                video_url=f"http://localhost:8088/videos/{os.path.basename(result_path)}",
+                video_path=result_path,
+                duration=3.4,  # 默认时长
+                frames=request.num_frames or 81,
+                size=request.image_size or "1280*720",
+                file_size=os.path.getsize(result_path) if os.path.exists(result_path) else 0
             )
             
             async with self.task_lock:
@@ -115,7 +168,7 @@ class VideoService:
                         "results": video_results.model_dump(),
                         "elapsed_time": elapsed_time
                     })
-                    self.successful_tasks += 1
+                    service_stats['successful_tasks'] += 1
             
             logger.info(f"Task {task_id} completed successfully in {elapsed_time}s")
             
@@ -128,7 +181,7 @@ class VideoService:
                 "Task cancelled by user",
                 reason="Task cancelled"
             )
-            self.cancelled_tasks += 1
+            service_stats['cancelled_tasks'] += 1
             logger.info(f"Task {task_id} was cancelled")
             
         except Exception as e:
@@ -144,63 +197,8 @@ class VideoService:
                 reason=error_msg,
                 elapsed_time=elapsed_time
             )
-            self.failed_tasks += 1
+            service_stats['failed_tasks'] += 1
             logger.error(f"Task {task_id} failed after {elapsed_time}s: {error_msg}")
-    
-    def _prepare_generation_params(self, request: VideoSubmitRequest) -> Dict[str, Any]:
-        """准备生成参数"""
-        return {
-            "prompt": request.prompt,
-            "image_url": request.image_url,
-            "image_size": request.image_size or "1280*720",
-            "num_frames": request.num_frames or 81,
-            "guidance_scale": request.guidance_scale or 3.0,
-            "infer_steps": request.infer_steps or 30,
-            "seed": request.seed,
-            "negative_prompt": request.negative_prompt,
-            
-            # 分布式参数
-            "vae_parallel": request.vae_parallel or False,
-            "ulysses_size": request.ulysses_size or 1,
-            "dit_fsdp": request.dit_fsdp or False,
-            "t5_fsdp": request.t5_fsdp or False,
-            "cfg_size": request.cfg_size or 1,
-            
-            # 性能优化参数
-            "use_attentioncache": request.use_attentioncache or False,
-            "start_step": request.start_step or 12,
-            "attentioncache_interval": request.attentioncache_interval or 4,
-            "end_step": request.end_step or 37,
-            "sample_solver": request.sample_solver or "unipc",
-            "sample_shift": request.sample_shift or 5.0,
-        }
-    
-    async def _generate_video_with_pipeline(self, task_id: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        """使用管道生成视频"""
-        
-        # 进度回调函数
-        async def progress_callback(step: int, total_steps: int, message: str = ""):
-            progress = int(20 + (step / total_steps) * 70)  # 20-90%的进度
-            await self._update_task_status(task_id, TaskStatus.RUNNING, progress, message)
-        
-        # 调用管道生成
-        result = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: self.pipeline.generate_video(
-                **params,
-                progress_callback=progress_callback
-            )
-        )
-        
-        # 最终进度更新
-        await self._update_task_status(
-            task_id, 
-            TaskStatus.RUNNING, 
-            95, 
-            "Finalizing video..."
-        )
-        
-        return result
     
     async def _update_task_status(
         self, 
@@ -251,42 +249,10 @@ class VideoService:
                 "reason": "Cancelled by user"
             })
             
-            self.cancelled_tasks += 1
+            service_stats['cancelled_tasks'] += 1
             
         logger.info(f"Task {task_id} cancelled")
         return True
-    
-    async def cleanup_expired_tasks(self, max_age_hours: int = 24) -> int:
-        """清理过期任务"""
-        current_time = time.time()
-        max_age_seconds = max_age_hours * 3600
-        cleaned_count = 0
-        
-        async with self.task_lock:
-            expired_tasks = []
-            
-            for task_id, task in self.tasks.items():
-                # 解析创建时间
-                try:
-                    created_at = datetime.fromisoformat(task["created_at"].replace("Z", "+00:00"))
-                    task_age = current_time - created_at.timestamp()
-                    
-                    if task_age > max_age_seconds:
-                        expired_tasks.append(task_id)
-                        
-                except Exception as e:
-                    logger.warning(f"Failed to parse timestamp for task {task_id}: {e}")
-                    expired_tasks.append(task_id)  # 清理无效时间戳的任务
-            
-            # 删除过期任务
-            for task_id in expired_tasks:
-                del self.tasks[task_id]
-                cleaned_count += 1
-        
-        if cleaned_count > 0:
-            logger.info(f"Cleaned up {cleaned_count} expired tasks")
-        
-        return cleaned_count
     
     async def get_service_stats(self) -> Dict[str, Any]:
         """获取服务统计信息"""
@@ -295,24 +261,267 @@ class VideoService:
                               if t["status"] in [TaskStatus.PENDING, TaskStatus.RUNNING]])
             
             return {
-                "total_tasks": self.total_tasks,
+                **service_stats,
                 "active_tasks": active_tasks,
-                "successful_tasks": self.successful_tasks,
-                "failed_tasks": self.failed_tasks,
-                "cancelled_tasks": self.cancelled_tasks,
-                "success_rate": (self.successful_tasks / max(self.total_tasks, 1)) * 100,
+                "success_rate": (service_stats['successful_tasks'] / max(service_stats['total_tasks'], 1)) * 100,
                 "tasks_in_memory": len(self.tasks)
             }
+
+# 全局服务实例
+video_service = None
+
+def init_distributed():
+    """初始化分布式环境"""
+    if world_size == 1:
+        logger.info("Single device mode")
+        return True
     
-    async def get_task_list(self, status_filter: Optional[TaskStatus] = None) -> List[Dict[str, Any]]:
-        """获取任务列表"""
-        async with self.task_lock:
-            tasks = list(self.tasks.values())
+    try:
+        # 检测设备类型
+        device_type, device_count = device_detector.detect_device()
+        
+        # 设置后端
+        if device_type.value == "npu":
+            import torch_npu
+            torch_npu.npu.set_device(local_rank)
+            backend = "hccl"
+        elif device_type.value == "cuda":
+            torch.cuda.set_device(local_rank)
+            backend = "nccl"
+        else:
+            backend = "gloo"
+        
+        # 初始化进程组
+        if not dist.is_initialized():
+            dist.init_process_group(
+                backend=backend,
+                rank=rank,
+                world_size=world_size
+            )
+        
+        # 同步所有进程
+        dist.barrier()
+        logger.info(f"Distributed initialized with {backend}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Distributed initialization failed: {e}")
+        return False
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期管理"""
+    global pipeline, video_service
+    
+    try:
+        logger.info("🔄 Starting application...")
+        
+        # 初始化分布式
+        if not init_distributed():
+            logger.warning("Distributed initialization failed, continuing...")
+        
+        # 只在主进程中初始化服务
+        if rank == 0:
+            # 创建管道
+            logger.info("🏭 Creating pipeline...")
             
-            if status_filter:
+            # 获取配置
+            ckpt_dir = os.environ.get('MODEL_CKPT_DIR', '/data/models/modelscope/hub/Wan-AI/Wan2.1-I2V-14B-720P')
+            config = {
+                'ckpt_dir': ckpt_dir,
+                't5_cpu': os.environ.get('T5_CPU', 'true').lower() == 'true',
+                'dit_fsdp': os.environ.get('DIT_FSDP', 'true').lower() == 'true',
+                'vae_parallel': os.environ.get('VAE_PARALLEL', 'true').lower() == 'true'
+            }
+            
+            pipeline = PipelineFactory.create_pipeline(**config)
+            video_service = VideoService(pipeline)
+            
+            logger.info("✅ Service initialized successfully")
+        else:
+            logger.info(f"⏳ Worker {rank} waiting...")
+        
+        yield
+        
+    except Exception as e:
+        logger.error(f"❌ Startup failed: {e}")
+        traceback.print_exc()
+        yield
+        
+    finally:
+        # 清理资源
+        if pipeline:
+            try:
+                pipeline.cleanup()
+            except Exception as e:
+                logger.warning(f"Pipeline cleanup warning: {e}")
+        
+        # 清理分布式
+        if world_size > 1 and dist.is_initialized():
+            try:
+                dist.destroy_process_group()
+            except Exception as e:
+                logger.warning(f"Distributed cleanup warning: {e}")
+
+# 创建应用
+app = FastAPI(
+    title="Multi-GPU I2V Generation API",
+    description="Fast and scalable image-to-video generation service",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# 添加中间件
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 静态文件服务
+os.makedirs("generated_videos", exist_ok=True)
+app.mount("/videos", StaticFiles(directory="generated_videos"), name="videos")
+
+# API 路由
+@app.get("/health")
+async def health_check():
+    """健康检查"""
+    device_type, device_count = device_detector.detect_device()
+    
+    return HealthResponse(
+        status="healthy" if video_service else "initializing",
+        timestamp=time.time(),
+        uptime=time.time() - startup_time,
+        config={
+            "rank": rank,
+            "world_size": world_size,
+            "local_rank": local_rank,
+            "device_type": device_type.value,
+            "device_count": device_count
+        },
+        service=await video_service.get_service_stats() if video_service else {},
+        resources={"memory": "unknown", "cpu_count": os.cpu_count()}
+    )
+
+@app.get("/metrics")
+async def get_metrics():
+    """获取监控指标"""
+    if not video_service:
+        raise HTTPException(status_code=503, detail="Service not ready")
+    
+    stats = await video_service.get_service_stats()
+    
+    return MetricsResponse(
+        timestamp=time.time(),
+        system={"uptime": time.time() - startup_time, "rank": rank},
+        service=stats,
+        tasks={"total": stats["total_tasks"], "active": stats["active_tasks"]},
+        performance={"success_rate": stats["success_rate"]}
+    )
+
+@app.post("/submit", response_model=VideoSubmitResponse)
+async def submit_video_generation(request: VideoSubmitRequest):
+    """提交视频生成任务"""
+    if rank != 0:
+        raise HTTPException(status_code=503, detail="Only available on main process")
+    
+    if not video_service:
+        raise HTTPException(status_code=503, detail="Service not ready")
+    
+    try:
+        task_id = await video_service.submit_video_task(request)
+        return VideoSubmitResponse(
+            requestId=task_id,
+            status=TaskStatus.PENDING,
+            message="Task submitted successfully",
+            estimated_time=180
+        )
+    except Exception as e:
+        logger.error(f"Submit error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/status", response_model=VideoStatusResponse)
+async def get_video_status(request: VideoStatusRequest):
+    """查询任务状态"""
+    if rank != 0:
+        raise HTTPException(status_code=503, detail="Only available on main process")
+    
+    if not video_service:
+        raise HTTPException(status_code=503, detail="Service not ready")
+    
+    task_data = await video_service.get_task_status(request.requestId)
+    
+    if not task_data:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    return VideoStatusResponse(**task_data)
+
+@app.post("/cancel", response_model=VideoCancelResponse)
+async def cancel_video_generation(request: VideoCancelRequest):
+    """取消任务"""
+    if rank != 0:
+        raise HTTPException(status_code=503, detail="Only available on main process")
+    
+    if not video_service:
+        raise HTTPException(status_code=503, detail="Service not ready")
+    
+    success = await video_service.cancel_task(request.requestId)
+    
+    if not success:
+        raise HTTPException(status_code=404, detail="Task not found or cannot be cancelled")
+    
+    return VideoCancelResponse(
+        requestId=request.requestId,
+        status="cancelled",
+        message="Task cancelled successfully"
+    )
+
+@app.get("/tasks")
+async def get_task_list(status: Optional[str] = None):
+    """获取任务列表"""
+    if rank != 0:
+        raise HTTPException(status_code=503, detail="Only available on main process")
+    
+    if not video_service:
+        raise HTTPException(status_code=503, detail="Service not ready")
+    
+    # 这里简化实现，实际应该在VideoService中实现
+    async with video_service.task_lock:
+        tasks = list(video_service.tasks.values())
+        
+        if status:
+            try:
+                status_filter = TaskStatus(status)
                 tasks = [t for t in tasks if t["status"] == status_filter]
-            
-            # 按创建时间倒序排列
-            tasks.sort(key=lambda x: x["created_at"], reverse=True)
-            
-            return tasks
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"Invalid status: {status}")
+        
+        tasks.sort(key=lambda x: x["created_at"], reverse=True)
+        
+        return {"tasks": tasks, "total": len(tasks), "filtered_by": status if status else "none"}
+
+# 主函数
+def main():
+    if rank == 0:
+        # 主进程运行HTTP服务
+        host = os.getenv("SERVER_HOST", "0.0.0.0")
+        port = int(os.getenv("SERVER_PORT", 8088))
+        
+        logger.info(f"🌐 Starting server on {host}:{port}")
+        
+        uvicorn.run(app, host=host, port=port, log_level="info", workers=1)
+    else:
+        # 工作进程等待
+        logger.info(f"⏳ Worker {rank} ready, waiting...")
+        try:
+            import time
+            while True:
+                time.sleep(60)  # 心跳
+                logger.debug(f"💓 Worker {rank} alive")
+        except KeyboardInterrupt:
+            logger.info(f"🛑 Worker {rank} stopping")
+
+if __name__ == "__main__":
+    main()

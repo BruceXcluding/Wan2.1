@@ -15,7 +15,8 @@ import importlib.util
 
 # 项目根目录
 PROJECT_ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(PROJECT_ROOT / "src"))
+sys.path.insert(0, str(PROJECT_ROOT))  # 外层utils
+sys.path.insert(0, str(PROJECT_ROOT / "src"))  # src模块
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
@@ -28,7 +29,7 @@ class StructureVerifier:
         self.project_root = PROJECT_ROOT
         self.errors = []
         self.warnings = []
-        self.success_count = 0
+        self.successes = []
         self.total_checks = 0
     
     def log_error(self, message: str):
@@ -43,31 +44,37 @@ class StructureVerifier:
     
     def log_success(self, message: str):
         """记录成功"""
-        self.success_count += 1
-        logger.info(f"✅ {message}")
+        self.successes.append(message)
+        logger.debug(message)
     
     def check_required_files(self) -> bool:
         """检查必需文件"""
-        print("🔍 Checking required files...")
+        print("\n📄 Checking required files...")
         
         required_files = [
-            # 核心源码
-            "src/__init__.py",
+            # 核心 API
             "src/i2v_api.py",
+            
+            # 数据模型
             "src/schemas/__init__.py",
             "src/schemas/video.py",
-            "src/services/__init__.py", 
-            "src/services/video_service.py",
+            
+            # 管道系统
             "src/pipelines/__init__.py",
             "src/pipelines/base_pipeline.py",
+            "src/pipelines/npu_pipeline.py", 
+            "src/pipelines/cuda_pipeline.py",
             "src/pipelines/pipeline_factory.py",
-            "src/utils/__init__.py",
-            "src/utils/device_detector.py",
             
-            # 脚本和工具
+            # 工具模块
+            "utils/__init__.py",
+            "utils/device_detector.py",
+            
+            # 启动脚本
             "scripts/start_service_general.sh",
-            "scripts/debug/debug_t5_warmup.py",
-            "scripts/debug/debug_memory.py",
+            "scripts/start_service_npu.sh",
+            
+            # 调试工具
             "scripts/debug/debug_device.py",
             "scripts/debug/debug_pipeline.py",
             
@@ -94,6 +101,7 @@ class StructureVerifier:
             for f in missing_files:
                 print(f"   - {f}")
         
+        print(f"✅ Found {len(existing_files)} required files")
         return len(missing_files) == 0
     
     def check_directory_structure(self) -> bool:
@@ -105,11 +113,10 @@ class StructureVerifier:
             "src/schemas", 
             "src/services",
             "src/pipelines",
-            "src/utils",
             "scripts",
             "scripts/debug",
             "tools",
-            "generated_videos",
+            "utils",
         ]
         
         missing_dirs = []
@@ -123,14 +130,16 @@ class StructureVerifier:
                 missing_dirs.append(dir_path)
                 self.log_error(f"Missing directory: {dir_path}")
         
-        # 检查可选目录
-        optional_dirs = ["tests", "docs", "logs", "requirements"]
+        # 检查并创建可选目录
+        optional_dirs = ["generated_videos", "logs"]
         for dir_path in optional_dirs:
             full_path = self.project_root / dir_path
-            if full_path.exists():
-                self.log_success(f"Optional directory exists: {dir_path}")
-            else:
-                self.log_warning(f"Optional directory missing: {dir_path}")
+            if not full_path.exists():
+                try:
+                    full_path.mkdir(exist_ok=True)
+                    self.log_success(f"Created directory: {dir_path}")
+                except Exception as e:
+                    self.log_warning(f"Could not create directory {dir_path}: {e}")
         
         return len(missing_dirs) == 0
     
@@ -139,37 +148,50 @@ class StructureVerifier:
         print("\n🐍 Checking Python imports...")
         
         import_tests = [
-            ("schemas.video", ["VideoSubmitRequest", "VideoStatusResponse"]),
-            ("utils.device_detector", ["device_detector", "DeviceType"]),
-            ("services.video_service", ["VideoService"]),
-            ("pipelines.pipeline_factory", ["PipelineFactory"]),
+            # 基础导入
+            ("torch", "PyTorch"),
+            ("fastapi", "FastAPI"),
+            ("uvicorn", "Uvicorn"),
+            ("pydantic", "Pydantic"),
+            
+            # 项目模块导入
+            ("schemas", "Project schemas"),
+            ("pipelines", "Project pipelines"),
+            ("utils", "Project utils"),
         ]
         
         failed_imports = []
         
-        for module_name, expected_attrs in import_tests:
+        for module_name, description in import_tests:
             self.total_checks += 1
             try:
-                module = importlib.import_module(module_name)
-                
-                # 检查预期属性
-                missing_attrs = []
-                for attr in expected_attrs:
-                    if not hasattr(module, attr):
-                        missing_attrs.append(attr)
-                
-                if missing_attrs:
-                    self.log_error(f"Module {module_name} missing attributes: {missing_attrs}")
-                    failed_imports.append(module_name)
+                if module_name in ["schemas", "pipelines", "utils"]:
+                    # 项目模块特殊处理
+                    spec = importlib.util.spec_from_file_location(
+                        module_name, 
+                        self.project_root / "src" / module_name / "__init__.py"
+                        if module_name in ["schemas", "pipelines"] 
+                        else self.project_root / module_name / "__init__.py"
+                    )
+                    if spec and spec.loader:
+                        module = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(module)
                 else:
-                    self.log_success(f"Module {module_name} imports correctly")
-                    
+                    # 外部库
+                    __import__(module_name)
+                
+                self.log_success(f"Import successful: {description}")
             except ImportError as e:
-                self.log_error(f"Failed to import {module_name}: {str(e)}")
-                failed_imports.append(module_name)
+                failed_imports.append((module_name, str(e)))
+                self.log_error(f"Import failed: {description} - {str(e)}")
             except Exception as e:
-                self.log_error(f"Error testing {module_name}: {str(e)}")
-                failed_imports.append(module_name)
+                failed_imports.append((module_name, str(e)))
+                self.log_warning(f"Import warning: {description} - {str(e)}")
+        
+        if failed_imports:
+            print(f"\n❌ {len(failed_imports)} import failures:")
+            for module, error in failed_imports:
+                print(f"   - {module}: {error}")
         
         return len(failed_imports) == 0
     
@@ -177,130 +199,119 @@ class StructureVerifier:
         """检查依赖包"""
         print("\n📦 Checking dependencies...")
         
-        # 基础依赖
-        required_packages = [
-            "fastapi",
-            "uvicorn", 
-            "pydantic",
-            "torch",
-            "asyncio",
-            "pathlib",
-        ]
+        # 检查 requirements.txt
+        requirements_file = self.project_root / "requirements.txt"
+        if not requirements_file.exists():
+            self.log_error("requirements.txt not found")
+            return False
         
-        # 设备特定依赖（可选）
-        optional_packages = [
-            "torch_npu",
-            "psutil",
-            "opencv-python",
-        ]
-        
-        missing_required = []
-        missing_optional = []
-        
-        for package in required_packages:
-            self.total_checks += 1
-            try:
-                importlib.import_module(package)
-                self.log_success(f"Required package available: {package}")
-            except ImportError:
-                missing_required.append(package)
-                self.log_error(f"Missing required package: {package}")
-        
-        for package in optional_packages:
-            try:
-                importlib.import_module(package)
-                self.log_success(f"Optional package available: {package}")
-            except ImportError:
-                missing_optional.append(package)
-                self.log_warning(f"Optional package missing: {package}")
-        
-        if missing_optional:
-            print(f"\n⚠️  Missing {len(missing_optional)} optional packages (may affect functionality):")
-            for p in missing_optional:
-                print(f"   - {p}")
-        
-        return len(missing_required) == 0
+        try:
+            # 读取要求
+            with open(requirements_file, 'r') as f:
+                requirements = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+            
+            print(f"Found {len(requirements)} requirements")
+            
+            # 检查关键依赖
+            critical_deps = ["torch", "fastapi", "uvicorn", "pydantic"]
+            missing_critical = []
+            
+            for dep in critical_deps:
+                self.total_checks += 1
+                if not any(dep in req for req in requirements):
+                    missing_critical.append(dep)
+                    self.log_error(f"Critical dependency missing: {dep}")
+                else:
+                    self.log_success(f"Critical dependency found: {dep}")
+            
+            return len(missing_critical) == 0
+            
+        except Exception as e:
+            self.log_error(f"Error reading requirements.txt: {str(e)}")
+            return False
     
     def check_configuration_files(self) -> bool:
         """检查配置文件"""
-        print("\n⚙️  Checking configuration files...")
+        print("\n⚙️  Checking configuration...")
         
         config_checks = []
         
-        # 检查 requirements.txt
-        self.total_checks += 1
-        req_file = self.project_root / "requirements.txt"
-        if req_file.exists():
-            try:
-                with open(req_file, 'r') as f:
-                    requirements = f.read().strip()
-                    if requirements:
-                        self.log_success("requirements.txt exists and not empty")
-                    else:
-                        self.log_warning("requirements.txt exists but is empty")
-            except Exception as e:
-                self.log_error(f"Error reading requirements.txt: {str(e)}")
-                config_checks.append("requirements.txt")
-        else:
-            self.log_error("requirements.txt not found")
-            config_checks.append("requirements.txt")
+        # 检查配置文件
+        config_files = [
+            ("src/config.py", False),  # 可选
+            ("src/device_manager.py", False),  # 可选
+        ]
         
-        # 检查启动脚本
-        self.total_checks += 1
-        start_script = self.project_root / "scripts" / "start_service_general.sh"
-        if start_script.exists():
-            if os.access(start_script, os.X_OK):
-                self.log_success("start_service_general.sh exists and is executable")
+        for config_file, required in config_files:
+            self.total_checks += 1
+            full_path = self.project_root / config_file
+            if full_path.exists():
+                # 检查文件是否为空
+                if full_path.stat().st_size == 0:
+                    self.log_warning(f"Configuration file is empty: {config_file}")
+                else:
+                    self.log_success(f"Configuration file exists: {config_file}")
+                config_checks.append(True)
             else:
-                self.log_warning("start_service_general.sh exists but not executable")
-        else:
-            self.log_error("start_service_general.sh not found")
-            config_checks.append("start_service_general.sh")
+                if required:
+                    self.log_error(f"Required configuration file missing: {config_file}")
+                    config_checks.append(False)
+                else:
+                    self.log_warning(f"Optional configuration file missing: {config_file}")
+                    config_checks.append(True)
         
-        return len(config_checks) == 0
+        # 检查环境变量示例
+        env_examples = [".env.example", "config/production.env.example"]
+        for env_file in env_examples:
+            full_path = self.project_root / env_file
+            if full_path.exists():
+                self.log_success(f"Environment example found: {env_file}")
+            else:
+                self.log_warning(f"Environment example missing: {env_file}")
+        
+        return all(config_checks)
     
     def check_runtime_environment(self) -> bool:
         """检查运行时环境"""
-        print("\n🔧 Checking runtime environment...")
+        print("\n🌍 Checking runtime environment...")
         
-        env_issues = []
+        env_checks = []
         
-        # 检查 Python 版本
+        # Python 版本检查
         self.total_checks += 1
         python_version = sys.version_info
         if python_version >= (3, 8):
             self.log_success(f"Python version: {python_version.major}.{python_version.minor}.{python_version.micro}")
+            env_checks.append(True)
         else:
-            self.log_error(f"Python version too old: {python_version.major}.{python_version.minor}.{python_version.micro} (requires >= 3.8)")
-            env_issues.append("python_version")
+            self.log_error(f"Python version too old: {python_version.major}.{python_version.minor}, requires >= 3.8")
+            env_checks.append(False)
         
-        # 检查设备可用性
+        # 设备检测
         self.total_checks += 1
         try:
             from utils.device_detector import device_detector
             device_type, device_count = device_detector.detect_device()
             self.log_success(f"Device detection: {device_type.value} x {device_count}")
+            env_checks.append(True)
         except Exception as e:
             self.log_error(f"Device detection failed: {str(e)}")
-            env_issues.append("device_detection")
+            env_checks.append(False)
         
-        # 检查端口可用性
-        self.total_checks += 1
-        try:
-            import socket
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(1)
-            result = sock.connect_ex(('127.0.0.1', 8088))
-            sock.close()
-            
-            if result == 0:
-                self.log_warning("Port 8088 is already in use")
+        # 关键环境变量检查
+        important_env_vars = {
+            "MODEL_CKPT_DIR": "Model checkpoint directory",
+            "PYTHONPATH": "Python path"
+        }
+        
+        for var, description in important_env_vars.items():
+            value = os.environ.get(var)
+            if value:
+                self.log_success(f"Environment variable {var}: {value}")
             else:
-                self.log_success("Port 8088 is available")
-        except Exception as e:
-            self.log_warning(f"Could not check port availability: {str(e)}")
+                self.log_warning(f"Environment variable {var} not set ({description})")
         
-        return len(env_issues) == 0
+        return all(env_checks)
     
     def check_permissions(self) -> bool:
         """检查文件权限"""
@@ -311,8 +322,7 @@ class StructureVerifier:
         # 检查脚本执行权限
         scripts_to_check = [
             "scripts/start_service_general.sh",
-            "scripts/debug/debug_t5_warmup.py",
-            "scripts/debug/debug_memory.py",
+            "scripts/start_service_npu.sh",
         ]
         
         for script_path in scripts_to_check:
@@ -323,6 +333,13 @@ class StructureVerifier:
                     self.log_success(f"Script {script_path} is executable")
                 else:
                     self.log_warning(f"Script {script_path} is not executable")
+                    # 尝试修复权限
+                    try:
+                        full_path.chmod(0o755)
+                        self.log_success(f"Fixed permissions for {script_path}")
+                    except Exception as e:
+                        self.log_error(f"Could not fix permissions for {script_path}: {e}")
+                        permission_issues.append(script_path)
             else:
                 self.log_error(f"Script {script_path} not found")
                 permission_issues.append(script_path)
@@ -364,21 +381,27 @@ class StructureVerifier:
     
     def print_summary(self, results: Dict[str, bool]):
         """打印检查总结"""
-        print("\n" + "=" * 80)
-        print("📊 VERIFICATION SUMMARY")
+        print("\n📋 Verification Summary")
         print("=" * 80)
         
-        passed_checks = sum(results.values())
-        total_categories = len(results)
+        # 打印结果
+        passed = 0
+        total = len(results)
         
-        print(f"Categories passed: {passed_checks}/{total_categories}")
-        print(f"Individual checks: {self.success_count}/{self.total_checks}")
+        for check_name, result in results.items():
+            status = "✅ PASS" if result else "❌ FAIL"
+            print(f"{check_name.title():<20} {status}")
+            if result:
+                passed += 1
         
-        print("\nCategory Results:")
-        for category, passed in results.items():
-            status = "✅ PASS" if passed else "❌ FAIL"
-            print(f"  {category:15} {status}")
+        print("-" * 80)
+        print(f"Total Checks: {self.total_checks}")
+        print(f"Categories: {passed}/{total} passed")
+        print(f"Successes: {len(self.successes)}")
+        print(f"Warnings: {len(self.warnings)}")
+        print(f"Errors: {len(self.errors)}")
         
+        # 显示错误和警告
         if self.errors:
             print(f"\n❌ Errors ({len(self.errors)}):")
             for error in self.errors:
@@ -402,6 +425,9 @@ class StructureVerifier:
 
 def main():
     """主函数"""
+    print("🔍 Project Structure Verifier")
+    print("Checking project integrity and configuration...")
+    
     verifier = StructureVerifier()
     
     try:

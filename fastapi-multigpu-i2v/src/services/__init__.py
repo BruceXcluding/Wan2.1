@@ -1,7 +1,7 @@
 """
-服务层包
+业务服务包
 """
 
-from services.video_service import VideoService
-
-__all__ = ["VideoService"]
+# 暂时为空，等有服务类时再添加
+__all__ = []
+__version__ = "1.0.0"

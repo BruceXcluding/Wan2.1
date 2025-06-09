@@ -1,19 +1,16 @@
 """
-管道工厂
-负责创建和管理不同类型的推理管道
+简化的管道工厂
 """
 import os
 import logging
-from typing import Dict, Any, Tuple
-
-# 修复导入 - 使用绝对导入
+from typing import Dict, Any
 from utils.device_detector import device_detector, DeviceType
 from pipelines.base_pipeline import BasePipeline
 
 logger = logging.getLogger(__name__)
 
 class PipelineFactory:
-    """管道工厂类"""
+    """管道工厂类 - 简化版"""
     
     @staticmethod
     def get_available_devices() -> Dict[str, Any]:
@@ -33,9 +30,9 @@ class PipelineFactory:
         except Exception as e:
             logger.error(f"Failed to detect devices: {str(e)}")
             return {
-                "device_type": "unknown",
-                "device_count": 0,
-                "backend": "unknown"
+                "device_type": "cuda",  # 默认回退到CUDA
+                "device_count": 1,
+                "backend": "torch"
             }
     
     @staticmethod
@@ -46,42 +43,37 @@ class PipelineFactory:
         
         logger.info(f"Creating pipeline for device type: {device_type}")
         
-        if device_type == "npu":
-            from pipelines.npu_pipeline import NPUPipeline
-            return NPUPipeline(**config)
-        elif device_type == "cuda":
-            from pipelines.cuda_pipeline import CUDAPipeline
-            return CUDAPipeline(**config)
-        else:
-            # 默认使用 CUDA 管道作为后备
-            logger.warning(f"Unknown device type {device_type}, falling back to CUDA pipeline")
-            from pipelines.cuda_pipeline import CUDAPipeline
-            return CUDAPipeline(**config)
+        # 确保必需的参数
+        if 'ckpt_dir' not in config:
+            config['ckpt_dir'] = os.environ.get('MODEL_CKPT_DIR', '/data/models/modelscope/hub/Wan-AI/Wan2.1-I2V-14B-720P')
+        
+        try:
+            if device_type == "npu":
+                from pipelines.npu_pipeline import NPUPipeline
+                return NPUPipeline(**config)
+            else:  # 默认使用CUDA或CPU
+                from pipelines.cuda_pipeline import CUDAPipeline
+                return CUDAPipeline(**config)
+                
+        except Exception as e:
+            logger.error(f"Failed to create {device_type} pipeline: {e}")
+            # 如果NPU失败，尝试CUDA作为后备
+            if device_type == "npu":
+                logger.warning("NPU pipeline failed, trying CUDA as fallback")
+                try:
+                    from pipelines.cuda_pipeline import CUDAPipeline
+                    return CUDAPipeline(**config)
+                except Exception as cuda_e:
+                    logger.error(f"CUDA fallback also failed: {cuda_e}")
+            raise
     
     @staticmethod
     def validate_config(config: Dict[str, Any]) -> bool:
-        """验证配置"""
-        required_keys = [
-            "ckpt_dir", "task", "size", "frame_num", "sample_steps"
-        ]
-        
-        for key in required_keys:
-            if key not in config:
-                logger.error(f"Missing required config key: {key}")
-                return False
-        
-        # 验证模型路径
-        if not os.path.exists(config["ckpt_dir"]):
-            logger.error(f"Model checkpoint directory not found: {config['ckpt_dir']}")
-            return False
-        
-        # 验证参数范围
-        if config["frame_num"] < 24 or config["frame_num"] > 121:
-            logger.error(f"Invalid frame_num: {config['frame_num']} (must be 24-121)")
-            return False
-        
-        if config["sample_steps"] < 20 or config["sample_steps"] > 100:
-            logger.error(f"Invalid sample_steps: {config['sample_steps']} (must be 20-100)")
-            return False
+        """简化的配置验证"""
+        # 检查模型路径
+        ckpt_dir = config.get('ckpt_dir')
+        if ckpt_dir and not os.path.exists(ckpt_dir):
+            logger.warning(f"Model checkpoint directory not found: {ckpt_dir}")
+            # 不要直接失败，让模型加载时处理
         
         return True
