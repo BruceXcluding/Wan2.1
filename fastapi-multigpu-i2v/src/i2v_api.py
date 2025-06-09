@@ -7,6 +7,10 @@ import sys
 from contextlib import asynccontextmanager
 from typing import Dict, Any
 
+# 在导入其他模块之前设置环境变量
+os.environ.setdefault("ASCEND_LAUNCH_BLOCKING", "0")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 from fastapi import FastAPI, HTTPException, status, Request, BackgroundTasks
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -46,33 +50,39 @@ SERVER_CONFIG = {
     "access_log": True,
 }
 
-# 模型配置
+# 模型配置 - 通过环境变量控制
 MODEL_CONFIG = {
     "ckpt_dir": os.environ.get(
         "MODEL_CKPT_DIR", 
         "/data/models/modelscope/hub/Wan-AI/Wan2.1-I2V-14B-720P"
     ),
-    "task": "i2v-14B",
-    "size": "1280*720",
-    "frame_num": 81,
-    "sample_steps": 40,
-    "dit_fsdp": True,
-    "t5_fsdp": True,
-    "cfg_size": 1,
-    "ulysses_size": 8,
-    "vae_parallel": True,
-    "use_attentioncache": True,
-    "start_step": 12,
-    "attentioncache_interval": 4,
-    "end_step": 37,
+    "task": os.environ.get("MODEL_TASK", "i2v-14B"),
+    "size": os.environ.get("DEFAULT_SIZE", "1280*720"),
+    "frame_num": int(os.environ.get("DEFAULT_FRAME_NUM", "81")),
+    "sample_steps": int(os.environ.get("DEFAULT_SAMPLE_STEPS", "40")),
+    
+    # 分布式配置 - 可通过环境变量控制
+    "dit_fsdp": os.environ.get("DIT_FSDP", "true").lower() == "true",
+    "t5_fsdp": os.environ.get("T5_FSDP", "false").lower() == "true",
+    "t5_cpu": os.environ.get("T5_CPU", "false").lower() == "true",  # 关键参数
+    "cfg_size": int(os.environ.get("CFG_SIZE", "1")),
+    "ulysses_size": int(os.environ.get("ULYSSES_SIZE", "8")),
+    "vae_parallel": os.environ.get("VAE_PARALLEL", "true").lower() == "true",
+    
+    # 性能优化
+    "use_attentioncache": os.environ.get("USE_ATTENTION_CACHE", "true").lower() == "true",
+    "start_step": int(os.environ.get("CACHE_START_STEP", "12")),
+    "attentioncache_interval": int(os.environ.get("CACHE_INTERVAL", "4")),
+    "end_step": int(os.environ.get("CACHE_END_STEP", "37")),
 }
 
-# 业务配置
+# 业务配置 - 根据 T5 CPU 模式调整
+t5_cpu_mode = MODEL_CONFIG["t5_cpu"]
 BUSINESS_CONFIG = {
-    "max_concurrent_tasks": int(os.environ.get("MAX_CONCURRENT_TASKS", 5)),
-    "task_timeout": int(os.environ.get("TASK_TIMEOUT", 1800)),  # 30分钟
-    "cleanup_interval": int(os.environ.get("CLEANUP_INTERVAL", 300)),  # 5分钟
-    "max_video_output_dir_size": int(os.environ.get("MAX_OUTPUT_DIR_SIZE", 50)),  # 50GB
+    "max_concurrent_tasks": int(os.environ.get("MAX_CONCURRENT_TASKS", "2" if t5_cpu_mode else "5")),
+    "task_timeout": int(os.environ.get("TASK_TIMEOUT", "2400" if t5_cpu_mode else "1800")),  # T5 CPU 需要更长时间
+    "cleanup_interval": int(os.environ.get("CLEANUP_INTERVAL", "300")),
+    "max_video_output_dir_size": int(os.environ.get("MAX_OUTPUT_DIR_SIZE", "50")),
     "allowed_hosts": os.environ.get("ALLOWED_HOSTS", "*").split(","),
 }
 
@@ -118,20 +128,27 @@ class ResourceManager:
         self.concurrent_tasks = 0
         self.max_concurrent = BUSINESS_CONFIG["max_concurrent_tasks"]
         self._lock = asyncio.Lock()
+        self.task_start_times = {}
     
-    async def acquire_task_slot(self) -> bool:
+    async def acquire_task_slot(self, task_id: str = None) -> bool:
         """获取任务槽位"""
         async with self._lock:
             if self.concurrent_tasks >= self.max_concurrent:
                 return False
             self.concurrent_tasks += 1
+            if task_id:
+                self.task_start_times[task_id] = time.time()
             return True
     
-    async def release_task_slot(self):
+    async def release_task_slot(self, task_id: str = None):
         """释放任务槽位"""
         async with self._lock:
             if self.concurrent_tasks > 0:
                 self.concurrent_tasks -= 1
+            if task_id and task_id in self.task_start_times:
+                duration = time.time() - self.task_start_times[task_id]
+                logger.info(f"Task {task_id} completed in {duration:.2f} seconds")
+                del self.task_start_times[task_id]
     
     async def get_stats(self) -> Dict[str, Any]:
         """获取资源统计"""
@@ -139,12 +156,15 @@ class ResourceManager:
             return {
                 "concurrent_tasks": self.concurrent_tasks,
                 "max_concurrent": self.max_concurrent,
-                "available_slots": self.max_concurrent - self.concurrent_tasks
+                "available_slots": self.max_concurrent - self.concurrent_tasks,
+                "active_tasks": len(self.task_start_times)
             }
 
 # ==================== 初始化 ====================
 
 logger.info(f"Initializing pipeline on rank {LOCAL_RANK}/{WORLD_SIZE}")
+logger.info(f"Model configuration: {MODEL_CONFIG}")
+logger.info(f"T5 CPU mode: {t5_cpu_mode}")
 
 try:
     pipeline = MultiGPUVideoPipeline(**MODEL_CONFIG)
@@ -180,6 +200,7 @@ if LOCAL_RANK == 0:
         app.state.video_service = video_service
         app.state.resource_manager = resource_manager
         app.state.start_time = time.time()
+        app.state.pipeline = pipeline
         
         yield
         
@@ -207,7 +228,7 @@ if LOCAL_RANK == 0:
                 if cleaned_count > 0:
                     logger.info(f"Cleaned up {cleaned_count} expired tasks")
                 
-                # 清理旧视频文件（可选）
+                # 清理旧视频文件
                 await cleanup_old_videos()
                 
             except asyncio.CancelledError:
@@ -218,7 +239,6 @@ if LOCAL_RANK == 0:
     async def cleanup_old_videos():
         """清理旧视频文件"""
         try:
-            import shutil
             from pathlib import Path
             
             video_dir = Path("generated_videos")
@@ -237,10 +257,14 @@ if LOCAL_RANK == 0:
                 files.sort(key=lambda x: x[1])  # 按修改时间排序
                 
                 for file_path, _ in files:
-                    file_path.unlink()
-                    total_size -= file_path.stat().st_size
-                    if total_size <= max_size * 0.8:  # 清理到80%
-                        break
+                    try:
+                        file_size = file_path.stat().st_size
+                        file_path.unlink()
+                        total_size -= file_size
+                        if total_size <= max_size * 0.8:  # 清理到80%
+                            break
+                    except Exception as e:
+                        logger.warning(f"Failed to delete {file_path}: {str(e)}")
                 
                 logger.info("Video cleanup completed")
         
@@ -268,7 +292,7 @@ if LOCAL_RANK == 0:
     # 创建 FastAPI 应用
     app = FastAPI(
         title="Multi-GPU Video Generation API",
-        description="基于 Wan2.1-I2V-14B-720P 的多卡分布式视频生成服务",
+        description=f"基于 Wan2.1-I2V-14B-720P 的多卡分布式视频生成服务 (T5 CPU: {t5_cpu_mode})",
         version="2.0.0",
         lifespan=lifespan,
         docs_url="/docs",
@@ -322,14 +346,18 @@ if LOCAL_RANK == 0:
     @app.post("/video/submit", response_model=dict, status_code=status.HTTP_202_ACCEPTED)
     async def submit_video_task(request: VideoSubmitRequest, background_tasks: BackgroundTasks):
         """提交视频生成任务"""
-        # 检查资源可用性
-        if not await resource_manager.acquire_task_slot():
-            raise HTTPException(
-                status_code=429, 
-                detail="服务器繁忙，请稍后重试"
-            )
-        
+        task_id = None
         try:
+            import uuid
+            task_id = str(uuid.uuid4()).replace('-', '')
+            
+            if not await resource_manager.acquire_task_slot(task_id):
+                raise HTTPException(
+                    status_code=429, 
+                    detail=f"服务器繁忙，请稍后重试。当前最大并发数: {BUSINESS_CONFIG['max_concurrent_tasks']}"
+                )
+            
+            # 提交任务
             task_id = await video_service.submit_video_task(request)
             
             # 添加资源释放任务
@@ -341,23 +369,33 @@ if LOCAL_RANK == 0:
             
             return {"requestId": task_id}
             
+        except HTTPException:
+            if task_id:
+                await resource_manager.release_task_slot(task_id)
+            raise
         except Exception as e:
-            # 释放资源
-            await resource_manager.release_task_slot()
+            if task_id:
+                await resource_manager.release_task_slot(task_id)
             logger.error(f"Failed to submit task: {str(e)}")
-            raise VideoGenerationException("任务提交失败", "TASK_SUBMIT_ERROR")
+            raise VideoGenerationException("任务提交失败，请检查参数或稍后重试", "TASK_SUBMIT_ERROR")
 
     async def release_task_slot_after_completion(task_id: str, resource_manager: ResourceManager):
         """任务完成后释放资源槽位"""
         try:
-            # 等待任务完成
+            max_wait_time = BUSINESS_CONFIG["task_timeout"]
+            start_time = time.time()
+            
             while True:
+                if time.time() - start_time > max_wait_time:
+                    logger.warning(f"Task {task_id} monitoring timeout after {max_wait_time}s")
+                    break
+                
                 task = await video_service.get_task_status(task_id)
                 if not task or task["status"] in ["Succeed", "Failed", "Cancelled"]:
                     break
                 await asyncio.sleep(5)
             
-            await resource_manager.release_task_slot()
+            await resource_manager.release_task_slot(task_id)
             logger.info(f"Released resource slot for task {task_id}")
             
         except Exception as e:
@@ -368,7 +406,7 @@ if LOCAL_RANK == 0:
         """查询任务状态"""
         task = await video_service.get_task_status(request.requestId)
         if not task:
-            raise HTTPException(status_code=404, detail="任务不存在")
+            raise HTTPException(status_code=404, detail="任务不存在或已过期")
         
         return VideoStatusResponse(**task)
 
@@ -380,9 +418,9 @@ if LOCAL_RANK == 0:
             task = await video_service.get_task_status(request.requestId)
             if not task:
                 raise HTTPException(status_code=404, detail="任务不存在")
-            return {"status": "Already finished"}
+            return {"status": "Already finished", "message": "任务已完成，无法取消"}
         
-        return {"status": "Cancelled"}
+        return {"status": "Cancelled", "message": "任务已取消"}
 
     @app.get("/health")
     async def health_check():
@@ -397,6 +435,13 @@ if LOCAL_RANK == 0:
                 "uptime": time.time() - app.state.start_time,
                 "rank": LOCAL_RANK,
                 "world_size": WORLD_SIZE,
+                "config": {
+                    "t5_cpu": MODEL_CONFIG["t5_cpu"],
+                    "dit_fsdp": MODEL_CONFIG["dit_fsdp"],
+                    "vae_parallel": MODEL_CONFIG["vae_parallel"],
+                    "max_concurrent": BUSINESS_CONFIG["max_concurrent_tasks"],
+                    "task_timeout": BUSINESS_CONFIG["task_timeout"]
+                },
                 "service": service_stats,
                 "resources": resource_stats
             }
@@ -415,6 +460,10 @@ if LOCAL_RANK == 0:
                 "timestamp": time.time(),
                 "service": service_stats,
                 "resources": resource_stats,
+                "config": {
+                    "model": MODEL_CONFIG,
+                    "business": BUSINESS_CONFIG
+                },
                 "system": {
                     "rank": LOCAL_RANK,
                     "world_size": WORLD_SIZE,
@@ -432,9 +481,16 @@ if LOCAL_RANK == 0:
             "service": "Multi-GPU Video Generation API",
             "version": "2.0.0",
             "status": "running",
-            "docs": "/docs",
-            "health": "/health",
-            "metrics": "/metrics"
+            "config": {
+                "t5_cpu": MODEL_CONFIG["t5_cpu"],
+                "distributed_inference": WORLD_SIZE > 1,
+                "concurrent_tasks": BUSINESS_CONFIG["max_concurrent_tasks"]
+            },
+            "endpoints": {
+                "docs": "/docs",
+                "health": "/health",
+                "metrics": "/metrics"
+            }
         }
 
     # ==================== 启动服务 ====================
@@ -443,6 +499,8 @@ if LOCAL_RANK == 0:
         """启动服务器"""
         try:
             logger.info(f"Starting FastAPI server on {SERVER_CONFIG['host']}:{SERVER_CONFIG['port']}")
+            logger.info(f"Configuration: T5 CPU={MODEL_CONFIG['t5_cpu']}, Max concurrent={BUSINESS_CONFIG['max_concurrent_tasks']}")
+            
             uvicorn.run(
                 app,
                 host=SERVER_CONFIG["host"],
@@ -459,6 +517,7 @@ if LOCAL_RANK == 0:
     # 优雅关闭处理
     def signal_handler(sig, frame):
         logger.info("Received shutdown signal, gracefully shutting down...")
+        pipeline.cleanup()
         sys.exit(0)
     
     signal.signal(signal.SIGINT, signal_handler)
@@ -469,7 +528,7 @@ if LOCAL_RANK == 0:
 
 else:
     # 非主进程只参与分布式推理
-    logger.info(f"Rank {LOCAL_RANK} ready for distributed inference")
+    logger.info(f"Rank {LOCAL_RANK} ready for distributed inference (T5 CPU: {t5_cpu_mode})")
     
     def signal_handler(sig, frame):
         logger.info(f"Rank {LOCAL_RANK} shutting down")

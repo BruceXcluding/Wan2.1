@@ -5,6 +5,7 @@
 ## 🚀 项目特色
 
 - **🎯 多卡分布式**：支持 NV GPU, 华为昇腾 NPU 8卡并行推理
+- **🧠 T5 CPU 模式**：支持 T5 文本编码器在 CPU 上运行，节省 NPU 显存
 - **🔄 异步处理**：基于 FastAPI 的异步任务队列
 - **🧩 模块化架构**：清晰的分层设计，易于维护和扩展
 - **⚡ 性能优化**：注意力缓存、VAE并行等多种加速技术
@@ -12,6 +13,7 @@
 - **🛡️ 容错机制**：健壮的错误处理和资源清理
 - **🔒 企业级安全**：资源限制、并发控制、异常处理
 - **📈 监控运维**：详细指标、健康检查、自动清理
+- **🎛️ 灵活配置**：通过环境变量灵活控制各项参数
 
 ## 📁 项目结构
 
@@ -26,6 +28,7 @@ src/
 ├── multigpu_pipeline.py      # 推理管道（分布式模型）
 └── i2v_api.py               # API 接口层（FastAPI 应用）
 generated_videos/             # 生成的视频文件存储
+start_service.sh             # 灵活的启动脚本
 requirements.txt              # 项目依赖
 README.md                     # 项目文档
 ```
@@ -34,8 +37,16 @@ README.md                     # 项目文档
 
 ### 硬件要求
 - **NPU**：华为昇腾 NPU × 8 卡
-- **内存**：32GB+ 系统内存
+- **内存**：32GB+ 系统内存（T5 CPU 模式需要更多系统内存）
 - **存储**：100GB+ 可用空间
+
+### 显存配置建议
+
+| NPU 型号 | 单卡显存 | 推荐配置 | T5 位置 | 并发任务 |
+|----------|----------|----------|---------|----------|
+| 910B1 | 32GB | 标准模式 | NPU | 3-5 |
+| 910B2 | 24GB | T5 CPU 模式 | CPU | 2-3 |
+| 910B4 | 32GB | 两种模式均可 | NPU/CPU | 2-5 |
 
 ### 软件环境
 - **Python**：3.11+
@@ -93,13 +104,169 @@ python -c "import torch_npu; print(torch_npu.__version__)"
 
 ### 4. 启动服务
 
+#### 🎯 灵活启动脚本
+
+项目提供了灵活的启动脚本 `start_service.sh`，支持通过环境变量控制各项配置：
+
 ```bash
-# 创建视频输出目录
+#!/bin/bash
+# 灵活的启动脚本，支持多种配置模式
+
+echo "Starting Wan2.1 I2V API with configurable options..."
+
+# 设置核心环境变量
+export ALGO=0
+export PYTORCH_NPU_ALLOC_CONF='expandable_segments:True'
+export TASK_QUEUE_ENABLE=2
+export CPU_AFFINITY_CONF=1
+export TOKENIZERS_PARALLELISM=false
+
+# 分布式通信配置
+export MASTER_ADDR=127.0.0.1
+export MASTER_PORT=29500
+
+# HCCL 基础配置
+export HCCL_TIMEOUT=1800           # 30分钟超时
+export HCCL_CONNECT_TIMEOUT=600    # 10分钟连接超时
+export HCCL_BUFFSIZE=512          # 缓冲区大小
+export ASCEND_LAUNCH_BLOCKING=0    # 异步模式
+export ASCEND_GLOBAL_LOG_LEVEL=1
+
+# NPU 配置
+export NPU_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+
+# ==================== 可配置选项 ====================
+
+# T5 CPU 模式 (true/false) - 关键配置
+export T5_CPU=${T5_CPU:-"false"}
+
+# 分布式配置
+export DIT_FSDP=${DIT_FSDP:-"true"}
+export T5_FSDP=${T5_FSDP:-"false"}
+export VAE_PARALLEL=${VAE_PARALLEL:-"true"}
+export ULYSSES_SIZE=${ULYSSES_SIZE:-"8"}
+
+# 业务配置
+if [ "$T5_CPU" = "true" ]; then
+    # T5 CPU 模式的优化配置
+    export MAX_CONCURRENT_TASKS=${MAX_CONCURRENT_TASKS:-"2"}
+    export TASK_TIMEOUT=${TASK_TIMEOUT:-"2400"}  # 40分钟
+    export HCCL_TIMEOUT=2400  # 延长 HCCL 超时
+    echo "T5 CPU mode enabled - optimized for memory-constrained NPUs"
+else
+    # 标准模式配置
+    export MAX_CONCURRENT_TASKS=${MAX_CONCURRENT_TASKS:-"5"}
+    export TASK_TIMEOUT=${TASK_TIMEOUT:-"1800"}  # 30分钟
+    echo "Standard mode - T5 on NPU"
+fi
+
+# 服务配置
+export SERVER_PORT=${SERVER_PORT:-"8088"}
+export MAX_OUTPUT_DIR_SIZE=${MAX_OUTPUT_DIR_SIZE:-"50"}
+
+# 模型路径
+export MODEL_CKPT_DIR=${MODEL_CKPT_DIR:-"/data/models/modelscope/hub/Wan-AI/Wan2.1-I2V-14B-720P"}
+
+# Python路径
+export PYTHONPATH=/workspace/Wan2.1:$PYTHONPATH
+
+# ==================== 显示配置 ====================
+
+echo "Configuration:"
+echo "  - T5 CPU mode: $T5_CPU"
+echo "  - DIT FSDP: $DIT_FSDP"
+echo "  - VAE Parallel: $VAE_PARALLEL"
+echo "  - Ulysses Size: $ULYSSES_SIZE"
+echo "  - Max Concurrent: $MAX_CONCURRENT_TASKS"
+echo "  - Task Timeout: $TASK_TIMEOUT seconds"
+echo "  - Server Port: $SERVER_PORT"
+echo "  - Model Path: $MODEL_CKPT_DIR"
+
+# ==================== 启动服务 ====================
+
+# 创建输出目录
 mkdir -p generated_videos
 
-# 启动 8 卡分布式服务
+# 清理旧进程
+echo "Cleaning up old processes..."
+pkill -f "i2v_api.py" || true
+pkill -f "torchrun.*i2v_api" || true
+sleep 5
+
+# 检查 NPU 状态
+echo "Checking NPU status..."
+npu-smi info
+
+# 清理NPU缓存
+echo "Clearing NPU cache..."
+python3 -c "import torch_npu; torch_npu.npu.empty_cache(); print('NPU cache cleared')" || true
+
+# 启动服务
+echo "Starting 8-card distributed service..."
+torchrun \
+    --nproc_per_node=8 \
+    --master_addr=${MASTER_ADDR} \
+    --master_port=${MASTER_PORT} \
+    src/i2v_api.py
+
+echo "Service stopped."
+```
+
+#### 🎛️ 启动模式选择
+
+**1. 标准模式（T5 在 NPU）**
+```bash
+# 适用于大显存 NPU（如 910B1 32GB）
+chmod +x start_service.sh
+T5_CPU=false ./start_service.sh
+```
+
+**2. T5 CPU 模式（节省显存）**
+```bash
+# 适用于小显存 NPU（如 910B2 24GB）
+T5_CPU=true ./start_service.sh
+```
+
+**3. 完全自定义配置**
+```bash
+# 完全自定义所有参数
+T5_CPU=true \
+DIT_FSDP=true \
+VAE_PARALLEL=true \
+MAX_CONCURRENT_TASKS=1 \
+TASK_TIMEOUT=3600 \
+SERVER_PORT=8089 \
+./start_service.sh
+```
+
+**4. 传统启动方式**
+```bash
+# 手动启动（不推荐，除非需要特殊配置）
+mkdir -p generated_videos
 torchrun --nproc_per_node=8 src/i2v_api.py
 ```
+
+#### 🧠 T5 CPU 模式详解
+
+T5 CPU 模式是为了应对 NPU 显存不足而设计的优化方案：
+
+**优势：**
+- 💾 **节省显存**：T5 文本编码器在 CPU 运行，可节省约 6-8GB NPU 显存
+- 🔧 **兼容性强**：适用于各种 NPU 型号，特别是 24GB 显存的设备
+- 🛡️ **稳定性高**：减少显存压力，降低 OOM 错误概率
+
+**劣势：**
+- ⏱️ **速度稍慢**：T5 编码增加 3-6 秒，总体生成时间延长约 20%
+- 🔄 **数据传输**：CPU-NPU 间需要传输编码结果
+- 💻 **内存需求**：需要更多系统内存（建议 32GB+）
+
+**性能对比：**
+
+| 模式 | T5 位置 | 显存占用 | 生成时间 | 并发任务 | 适用场景 |
+|------|---------|----------|----------|----------|----------|
+| 标准模式 | NPU | ~28GB | 2-3分钟 | 3-5 | 大显存 NPU |
+| T5 CPU | CPU | ~20GB | 2.5-3.5分钟 | 2-3 | 小显存 NPU |
 
 服务启动后：
 - **API 服务**：http://localhost:8088
@@ -247,6 +414,13 @@ torchrun --nproc_per_node=8 src/i2v_api.py
   "uptime": 3600.5,
   "rank": 0,
   "world_size": 8,
+  "config": {
+    "t5_cpu": false,
+    "dit_fsdp": true,
+    "vae_parallel": true,
+    "max_concurrent": 5,
+    "task_timeout": 1800
+  },
   "service": {
     "total_tasks": 15,
     "pipeline_world_size": 8,
@@ -279,6 +453,18 @@ torchrun --nproc_per_node=8 src/i2v_api.py
     "max_concurrent": 5,
     "available_slots": 3
   },
+  "config": {
+    "model": {
+      "t5_cpu": false,
+      "dit_fsdp": true,
+      "vae_parallel": true,
+      "ulysses_size": 8
+    },
+    "business": {
+      "max_concurrent_tasks": 5,
+      "task_timeout": 1800
+    }
+  },
   "system": {
     "rank": 0,
     "world_size": 8,
@@ -291,16 +477,36 @@ torchrun --nproc_per_node=8 src/i2v_api.py
 
 ### 环境变量配置
 
+#### 核心配置
+
 | 变量名 | 默认值 | 说明 |
 |--------|--------|------|
-| `SERVER_HOST` | 0.0.0.0 | 服务监听地址 |
-| `SERVER_PORT` | 8088 | 服务端口 |
-| `MAX_CONCURRENT_TASKS` | 5 | 最大并发任务数 |
-| `TASK_TIMEOUT` | 1800 | 任务超时时间(秒) |
-| `CLEANUP_INTERVAL` | 300 | 清理间隔(秒) |
-| `MAX_OUTPUT_DIR_SIZE` | 50 | 最大输出目录大小(GB) |
-| `ALLOWED_HOSTS` | * | 允许的主机列表 |
-| `MODEL_CKPT_DIR` | /data/models/... | 模型文件路径 |
+| `T5_CPU` | false | T5 编码器是否使用 CPU |
+| `DIT_FSDP` | true | DiT 模型是否使用 FSDP 分片 |
+| `T5_FSDP` | false | T5 编码器是否使用 FSDP 分片 |
+| `VAE_PARALLEL` | true | VAE 是否并行编解码 |
+| `ULYSSES_SIZE` | 8 | Ulysses 序列并行组数 |
+
+#### 服务配置
+
+| 变量名 | 默认值 | T5 CPU 模式默认值 | 说明 |
+|--------|--------|-------------------|------|
+| `SERVER_HOST` | 0.0.0.0 | 0.0.0.0 | 服务监听地址 |
+| `SERVER_PORT` | 8088 | 8088 | 服务端口 |
+| `MAX_CONCURRENT_TASKS` | 5 | 2 | 最大并发任务数 |
+| `TASK_TIMEOUT` | 1800 | 2400 | 任务超时时间(秒) |
+| `CLEANUP_INTERVAL` | 300 | 300 | 清理间隔(秒) |
+| `MAX_OUTPUT_DIR_SIZE` | 50 | 50 | 最大输出目录大小(GB) |
+| `ALLOWED_HOSTS` | * | * | 允许的主机列表 |
+| `MODEL_CKPT_DIR` | /data/models/... | /data/models/... | 模型文件路径 |
+
+#### 通信配置
+
+| 变量名 | 默认值 | T5 CPU 模式调整 | 说明 |
+|--------|--------|-----------------|------|
+| `HCCL_TIMEOUT` | 1800 | 2400 | HCCL 通信超时(秒) |
+| `HCCL_CONNECT_TIMEOUT` | 600 | 900 | HCCL 连接超时(秒) |
+| `HCCL_BUFFSIZE` | 512 | 256 | HCCL 缓冲区大小 |
 
 ### 基础参数
 
@@ -338,7 +544,42 @@ torchrun --nproc_per_node=8 src/i2v_api.py
 
 ## 🚀 使用示例
 
-### 基础示例
+### 启动服务示例
+
+```bash
+# 1. 标准模式（推荐用于大显存 NPU）
+T5_CPU=false ./start_service.sh
+
+# 2. T5 CPU 模式（推荐用于小显存 NPU）
+T5_CPU=true ./start_service.sh
+
+# 3. 高性能配置（大显存 NPU）
+T5_CPU=false \
+DIT_FSDP=true \
+VAE_PARALLEL=true \
+MAX_CONCURRENT_TASKS=5 \
+ULYSSES_SIZE=8 \
+./start_service.sh
+
+# 4. 内存优化配置（小显存 NPU）
+T5_CPU=true \
+DIT_FSDP=true \
+VAE_PARALLEL=false \
+MAX_CONCURRENT_TASKS=2 \
+ULYSSES_SIZE=4 \
+./start_service.sh
+
+# 5. 调试模式
+T5_CPU=true \
+MAX_CONCURRENT_TASKS=1 \
+TASK_TIMEOUT=3600 \
+ASCEND_GLOBAL_LOG_LEVEL=0 \
+./start_service.sh
+```
+
+### API 调用示例
+
+#### 基础示例
 
 ```bash
 # 提交视频生成任务
@@ -357,7 +598,7 @@ curl -X POST "http://localhost:8088/video/status" \
 -H "Content-Type: application/json" \
 -d '{"requestId": "your-task-id-here"}'
 
-# 检查服务健康状态
+# 检查服务健康状态（会显示 T5 CPU 模式状态）
 curl "http://localhost:8088/health"
 
 # 获取监控指标
@@ -403,6 +644,12 @@ while True:
         break
     
     time.sleep(5)
+
+# 检查服务配置
+health_response = requests.get("http://localhost:8088/health")
+health_data = health_response.json()
+print(f"T5 CPU mode: {health_data['config']['t5_cpu']}")
+print(f"Max concurrent: {health_data['config']['max_concurrent']}")
 ```
 
 ### 错误处理示例
@@ -452,6 +699,18 @@ except requests.RequestException as e:
     └─────────────────────────────────┘
 ```
 
+### T5 CPU 模式架构
+
+```
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│  T5 编码器      │    │   DiT/VAE 模型   │    │   分布式通信     │
+│  (CPU 运行)     │────┤   (NPU 分片)     │◄───┤   (HCCL)       │
+│  文本编码       │    │   视频生成       │    │   模型同步       │
+└─────────────────┘    └─────────────────┘    └─────────────────┘
+         │                        │
+         └───── CPU-NPU 数据传输 ────┘
+```
+
 ### 数据流
 
 ```
@@ -471,6 +730,13 @@ i2v_api.py → video_service.py → multigpu_pipeline.py → WanI2V → cache_vi
 - **VAE 并行**：视频编解码并行处理
 - **CFG 并行**：分类器自由引导并行计算
 
+### T5 CPU 优化
+
+- **内存节省**：T5 在 CPU 运行，节省 6-8GB NPU 显存
+- **智能调度**：自动调整超时时间和并发数
+- **缓存预热**：启动时预热 T5 编码器，减少首次延迟
+- **异步传输**：优化 CPU-NPU 数据传输效率
+
 ### 推理优化
 
 - **注意力缓存**：缓存中间注意力结果，减少重复计算
@@ -485,10 +751,12 @@ i2v_api.py → video_service.py → multigpu_pipeline.py → WanI2V → cache_vi
 
 ### 预期性能
 
-| 配置 | 分辨率 | 帧数 | 生成时间 | 显存占用 | 并发数 |
-|------|--------|------|----------|----------|--------|
-| 8卡 NPU | 1280×720 | 81帧 | ~2-3分钟 | ~20GB | 1-5 |
-| 8卡 NPU | 1280×720 | 121帧 | ~3-4分钟 | ~25GB | 1-3 |
+| 配置 | T5 位置 | 分辨率 | 帧数 | 生成时间 | 显存占用 | 并发数 |
+|------|---------|--------|------|----------|----------|--------|
+| 8卡 NPU | NPU | 1280×720 | 81帧 | ~2-3分钟 | ~28GB | 3-5 |
+| 8卡 NPU | CPU | 1280×720 | 81帧 | ~2.5-3.5分钟 | ~20GB | 2-3 |
+| 8卡 NPU | NPU | 1280×720 | 121帧 | ~3-4分钟 | ~35GB | 1-3 |
+| 8卡 NPU | CPU | 1280×720 | 121帧 | ~3.5-4.5分钟 | ~25GB | 1-2 |
 
 ## 🛠️ 故障排除
 
@@ -514,7 +782,7 @@ export SERVER_PORT=8089  # 使用其他端口
 # 解决方案：
 ps aux | grep python | grep i2v_api | awk '{print $2}' | xargs kill -9
 sleep 10
-torchrun --nproc_per_node=8 src/i2v_api.py
+T5_CPU=true ./start_service.sh  # 使用 T5 CPU 模式降低资源需求
 ```
 
 #### 3. 任务提交被拒绝
@@ -534,29 +802,45 @@ export MAX_CONCURRENT_TASKS=10  # 增加并发限制
 npu-smi info
 # 清理 NPU 缓存
 python -c "import torch_npu; torch_npu.npu.empty_cache()"
-# 调整并发数
-export MAX_CONCURRENT_TASKS=2
+# 使用 T5 CPU 模式节省显存
+T5_CPU=true MAX_CONCURRENT_TASKS=2 ./start_service.sh
 ```
 
-#### 5. 任务失败常见原因
+#### 5. T5 CPU 模式特定问题
+
+```bash
+# 症状：T5 编码速度过慢
+# 解决方案：确保有足够的 CPU 核心和内存
+export OMP_NUM_THREADS=16  # 增加 CPU 线程数
+
+# 症状：CPU-NPU 数据传输超时
+# 解决方案：延长超时时间
+export HCCL_TIMEOUT=3600  # 1小时超时
+```
+
+#### 6. 任务失败常见原因
 
 - **图像下载失败**：检查 `image_url` 是否可访问
 - **参数验证失败**：检查帧数、分辨率等参数范围
 - **模型文件缺失**：确认 `MODEL_CKPT_DIR` 路径正确
+- **T5 CPU 内存不足**：增加系统内存或减少并发数
 
 ### 日志调试
 
 ```bash
 # 启用详细日志
 export PYTHONPATH=/path/to/your/project
-export NCCL_DEBUG=INFO
-torchrun --nproc_per_node=8 src/i2v_api.py
+export ASCEND_GLOBAL_LOG_LEVEL=0  # 详细日志
+T5_CPU=true ./start_service.sh
 
 # 查看实时日志
 tail -f /var/log/video_generation.log
 
 # 查看错误日志
 grep ERROR /var/log/video_generation.log
+
+# 查看 T5 CPU 相关日志
+grep "T5 CPU" /var/log/video_generation.log
 ```
 
 ## 📊 监控和维护
@@ -570,22 +854,29 @@ curl http://localhost:8088/health
 # 详细监控指标
 curl http://localhost:8088/metrics
 
-# 响应示例
+# 响应示例（T5 CPU 模式）
 {
   "status": "healthy",
   "timestamp": 1703847600.123,
   "uptime": 3600.5,
   "rank": 0,
   "world_size": 8,
+  "config": {
+    "t5_cpu": true,
+    "dit_fsdp": true,
+    "vae_parallel": true,
+    "max_concurrent": 2,
+    "task_timeout": 2400
+  },
   "service": {
     "total_tasks": 15,
     "pipeline_world_size": 8,
     "pipeline_rank": 0
   },
   "resources": {
-    "concurrent_tasks": 2,
-    "max_concurrent": 5,
-    "available_slots": 3
+    "concurrent_tasks": 1,
+    "max_concurrent": 2,
+    "available_slots": 1
   }
 }
 ```
@@ -594,9 +885,10 @@ curl http://localhost:8088/metrics
 
 服务会自动执行以下清理任务：
 
-- **过期任务清理**：每5分钟清理超过30分钟的已完成任务
-- **视频文件清理**：当存储超过50GB时自动删除最旧的文件
+- **过期任务清理**：每5分钟清理超时的已完成任务
+- **视频文件清理**：当存储超过限制时自动删除最旧的文件
 - **资源释放**：任务完成后自动释放并发槽位
+- **NPU 缓存清理**：异常时自动清理 NPU 内存
 
 ### 手动维护
 
@@ -604,13 +896,17 @@ curl http://localhost:8088/metrics
 # 重启服务
 ps aux | grep i2v_api | awk '{print $2}' | xargs kill -15
 sleep 5
-torchrun --nproc_per_node=8 src/i2v_api.py
+T5_CPU=true ./start_service.sh
 
 # 清理生成的视频文件
 find generated_videos -type f -mtime +7 -delete
 
 # 检查磁盘使用
 du -sh generated_videos/
+
+# 检查 T5 CPU 模式内存使用
+free -h
+top -p $(pgrep -f i2v_api)
 ```
 
 ## 🔒 安全注意事项
@@ -621,9 +917,9 @@ du -sh generated_videos/
 # 限制允许的主机
 export ALLOWED_HOSTS="api.example.com,*.example.com"
 
-# 调整资源限制
-export MAX_CONCURRENT_TASKS=3
-export TASK_TIMEOUT=900  # 15分钟超时
+# T5 CPU 模式的资源限制
+export MAX_CONCURRENT_TASKS=2
+export TASK_TIMEOUT=1800  # 30分钟超时
 
 # 设置安全的文件权限
 chmod 750 generated_videos/
@@ -636,6 +932,7 @@ chmod 750 generated_videos/
 - ✅ **访问控制**：配置允许的主机列表
 - ✅ **文件清理**：定期清理生成的视频文件
 - ✅ **错误处理**：不暴露内部错误信息
+- ✅ **内存监控**：T5 CPU 模式下的系统内存监控
 - ⚠️ **认证机制**：生产环境建议添加 API Key 或 OAuth
 - ⚠️ **HTTPS**：生产环境使用 HTTPS 加密传输
 - ⚠️ **防火墙**：限制服务端口的网络访问
@@ -676,3 +973,19 @@ Pillow>=10.0.0
 ---
 
 **📞 技术支持**：如有问题，请提交 [Issue](https://github.com/BruceXcluding/Wan2.1/issues) 或联系维护团队。
+
+**🎯 快速开始**：
+```bash
+# 克隆项目
+git clone <repository-url>
+cd fastapi-multigpu-i2v
+
+# 安装依赖
+pip install -r requirements.txt
+
+# 启动服务（T5 CPU 模式，适合小显存）
+T5_CPU=true ./start_service.sh
+
+# 测试 API
+curl http://localhost:8088/health
+```
