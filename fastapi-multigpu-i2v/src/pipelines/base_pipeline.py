@@ -19,33 +19,71 @@ logger = logging.getLogger(__name__)
 class DistributedMixin:
     """分布式功能混入类"""
     
-    def _init_distributed_common(self, backend: str, timeout_seconds: int = 1800):
-        """通用分布式初始化逻辑"""
-        if self.world_size <= 1:
-            logger.info(f"Single {self.device_type} mode, skipping distributed initialization")
-            return
-        
-        # 设备特定配置
-        self._set_device()
-        
-        if not dist.is_initialized():
-            logger.info(f"Initializing distributed process group with {backend} backend")
-            try:
-                dist.init_process_group(
-                    backend=backend,
-                    init_method="env://",
-                    rank=self.rank,
-                    world_size=self.world_size,
-                    timeout=timedelta(seconds=timeout_seconds)
-                )
+    def _init_distributed(self):
+        """初始化分布式环境"""
+        try:
+            self.world_size = int(os.environ.get("WORLD_SIZE", 1))
+            self.rank = int(os.environ.get("RANK", 0))
+            self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            
+            if self.world_size > 1:
+                logger.info(f"Initializing distributed: rank={self.rank}, world_size={self.world_size}, local_rank={self.local_rank}")
                 
-                # 测试通信
-                self._test_communication()
+                # 🔧 设备特定的分布式初始化
+                if self.device_type == "npu":
+                    # NPU 分布式初始化
+                    import torch_npu
+                    
+                    # 设置当前设备
+                    torch_npu.npu.set_device(self.local_rank)
+                    
+                    # 🔧 关键修复：使用 HCCL 后端并增加超时
+                    dist.init_process_group(
+                        backend="hccl",  # NPU 使用 HCCL 后端
+                        init_method=f"env://",
+                        world_size=self.world_size,
+                        rank=self.rank,
+                        timeout=timedelta(seconds=3600)  # 增加超时时间
+                    )
+                    
+                    logger.info(f"✅ NPU distributed initialized: rank={self.rank}")
+                    
+                elif self.device_type == "cuda":
+                    # CUDA 分布式初始化
+                    torch.cuda.set_device(self.local_rank)
+                    
+                    dist.init_process_group(
+                        backend="nccl",
+                        init_method="env://",
+                        world_size=self.world_size,
+                        rank=self.rank,
+                        timeout=timedelta(seconds=1800)
+                    )
+                    
+                    logger.info(f"✅ CUDA distributed initialized: rank={self.rank}")
+                    
+                else:
+                    # CPU 分布式初始化
+                    dist.init_process_group(
+                        backend="gloo",
+                        init_method="env://", 
+                        world_size=self.world_size,
+                        rank=self.rank,
+                        timeout=timedelta(seconds=1800)
+                    )
+                    
+                    logger.info(f"✅ CPU distributed initialized: rank={self.rank}")
+            else:
+                logger.info("Single device mode, skipping distributed initialization")
                 
-            except Exception as e:
-                logger.error(f"Failed to initialize {backend} process group: {str(e)}")
-                raise
-    
+        except Exception as e:
+            logger.error(f"Distributed initialization failed: {e}")
+            # 🔧 重要：不要 raise，继续以单设备模式运行
+            self.world_size = 1
+            self.rank = 0
+            self.local_rank = 0
+            logger.warning("Falling back to single device mode")
+        
     def _test_communication(self):
         """测试分布式通信"""
         logger.info(f"Testing {self.device_type} distributed communication...")

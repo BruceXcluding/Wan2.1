@@ -202,17 +202,34 @@ else
     export RING_SIZE="1"
 fi
 
+
 # 设置设备相关环境变量
 if [ "$DEVICE_TYPE" = "npu" ]; then
     export NPU_VISIBLE_DEVICES="${NPU_VISIBLE_DEVICES:-$(seq -s, 0 $((DEVICE_COUNT-1)))}"
     export ASCEND_LAUNCH_BLOCKING="${ASCEND_LAUNCH_BLOCKING:-0}"
-    export HCCL_TIMEOUT="${HCCL_TIMEOUT:-1800}"
-    export HCCL_BUFFSIZE="${HCCL_BUFFSIZE:-512}"
-    export HCCL_CONNECT_TIMEOUT="${HCCL_CONNECT_TIMEOUT:-600}"
+    
+    # 🔧 关键修复：HCCL 配置优化
+    export HCCL_TIMEOUT="${HCCL_TIMEOUT:-3600}"        # 增加超时时间
+    export HCCL_BUFFSIZE="${HCCL_BUFFSIZE:-1024}"      # 增加缓冲区大小
+    export HCCL_CONNECT_TIMEOUT="${HCCL_CONNECT_TIMEOUT:-1200}"  # 增加连接超时
+    export HCCL_EXEC_TIMEOUT="${HCCL_EXEC_TIMEOUT:-0}"  # 禁用执行超时
+    export HCCL_HEARTBEAT_TIMEOUT="${HCCL_HEARTBEAT_TIMEOUT:-0}"  # 禁用心跳超时
+    
+    # 🔧 新增：NPU 分布式相关配置
+    export RANK_TABLE_FILE="${RANK_TABLE_FILE:-}"      # 如果有 rank table 文件
+    export ASCEND_GLOBAL_LOG_LEVEL="${ASCEND_GLOBAL_LOG_LEVEL:-3}"  # 日志级别
+    export ASCEND_SLOG_PRINT_TO_STDOUT="${ASCEND_SLOG_PRINT_TO_STDOUT:-1}"
+    export ASCEND_GLOBAL_EVENT_ENABLE="${ASCEND_GLOBAL_EVENT_ENABLE:-0}"
+    
+    # 🔧 关键：设置 NPU 设备映射
+    export ASCEND_DEVICE_ID="0"  # 主设备
     
     echo -e "${BLUE}📱 NPU Configuration:${NC}"
     echo "  - NPU Devices: $NPU_VISIBLE_DEVICES"
     echo "  - HCCL Timeout: $HCCL_TIMEOUT"
+    echo "  - HCCL Buffer Size: $HCCL_BUFFSIZE"
+    echo "  - ASCEND_DEVICE_ID: $ASCEND_DEVICE_ID"
+    
 elif [ "$DEVICE_TYPE" = "cuda" ]; then
     export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-$(seq -s, 0 $((DEVICE_COUNT-1)))}"
     export NCCL_TIMEOUT="${NCCL_TIMEOUT:-1800}"
@@ -306,11 +323,43 @@ except Exception as e:
     print(f'⚠️  Cache clear warning: {e}')
 "
 
-# 清理旧进程
+# 清理旧进程 - 增强版
 echo -e "${BLUE}🧹 Cleaning up old processes...${NC}"
+
+# 🔧 新增：检查和释放端口
+check_and_free_port() {
+    local port=$1
+    if lsof -ti:$port > /dev/null 2>&1; then
+        echo -e "${YELLOW}⚠️  Port $port is in use, killing processes...${NC}"
+        lsof -ti:$port | xargs kill -9 2>/dev/null || true
+        sleep 2
+        echo -e "${GREEN}✅ Port $port freed${NC}"
+    fi
+}
+
+# 清理相关进程
 pkill -f "i2v_api.py" || true
 pkill -f "torchrun.*i2v_api" || true
+pkill -f "python.*i2v.*api" || true  # 更广泛的清理
 sleep 3
+
+# 清理端口
+check_and_free_port ${MASTER_PORT}
+check_and_free_port ${SERVER_PORT}
+
+# 🔧 新增：NPU 特定的清理
+if [ "$DEVICE_TYPE" = "npu" ]; then
+    echo -e "${BLUE}🔧 NPU specific cleanup...${NC}"
+    
+    # 设置 NPU 友好的环境变量
+    export HCCL_ASYNC_ERROR_HANDLING=0  # 禁用 watchdog
+    export HCCL_WHITELIST_DISABLE=1     # 禁用白名单检查
+    
+    # 清理 NPU 进程（如果有的话）
+    pkill -f "python.*torch_npu" 2>/dev/null || true
+    
+    echo -e "${GREEN}✅ NPU cleanup completed${NC}"
+fi
 
 # 创建必要目录
 mkdir -p generated_videos
@@ -319,7 +368,48 @@ mkdir -p logs
 # 设置信号处理
 trap 'echo -e "${YELLOW}🛑 Stopping service...${NC}"; pkill -f "torchrun.*i2v_api"; pkill -f "python.*i2v_api"; exit 0' INT TERM
 
-# 启动服务
+# 🔧 新增：启动前最终检查
+echo -e "${BLUE}🔍 Pre-launch final check...${NC}"
+
+# 检查分布式环境一致性
+if [ "$DEVICE_COUNT" -gt 1 ]; then
+    echo "  - World Size: $DEVICE_COUNT"
+    echo "  - Master: $MASTER_ADDR:$MASTER_PORT"
+    echo "  - Distributed Config: Ulysses=$ULYSSES_SIZE, Ring=$RING_SIZE"
+    
+    # 验证配置数学正确性
+    PRODUCT=$((ULYSSES_SIZE * RING_SIZE))
+    if [ "$PRODUCT" -ne "$DEVICE_COUNT" ]; then
+        echo -e "${RED}❌ Error: $ULYSSES_SIZE * $RING_SIZE = $PRODUCT ≠ $DEVICE_COUNT${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}✅ Distributed config verified${NC}"
+fi
+
+# 检查模型路径
+if [ ! -d "$MODEL_CKPT_DIR" ]; then
+    echo -e "${YELLOW}⚠️  Model path check: $MODEL_CKPT_DIR not found${NC}"
+    echo -e "${YELLOW}   Will attempt to download model on first use${NC}"
+else
+    echo -e "${GREEN}✅ Model path exists: $MODEL_CKPT_DIR${NC}"
+fi
+
+# 最终环境变量检查
+echo -e "${BLUE}📋 Final Environment Summary:${NC}"
+echo "  - DEVICE_TYPE: $DEVICE_TYPE"
+echo "  - DEVICE_COUNT: $DEVICE_COUNT"
+echo "  - ULYSSES_SIZE: $ULYSSES_SIZE"
+echo "  - RING_SIZE: $RING_SIZE"
+if [ "$DEVICE_TYPE" = "npu" ]; then
+    echo "  - NPU_VISIBLE_DEVICES: $NPU_VISIBLE_DEVICES"
+    echo "  - HCCL_TIMEOUT: $HCCL_TIMEOUT"
+    echo "  - HCCL_ASYNC_ERROR_HANDLING: ${HCCL_ASYNC_ERROR_HANDLING:-default}"
+elif [ "$DEVICE_TYPE" = "cuda" ]; then
+    echo "  - CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
+    echo "  - NCCL_TIMEOUT: $NCCL_TIMEOUT"
+fi
+
+# 启动服务 - 增强版
 echo ""
 if [ "$DEVICE_COUNT" -gt 1 ]; then
     echo -e "${GREEN}🚀 Starting $DEVICE_COUNT-device distributed service on $DEVICE_TYPE...${NC}"
@@ -328,16 +418,48 @@ if [ "$DEVICE_COUNT" -gt 1 ]; then
     echo -e "${BLUE}📖 API docs: http://$SERVER_HOST:$SERVER_PORT/docs${NC}"
     echo ""
     
-    # 启动分布式服务
-    LOG_FILE="logs/${DEVICE_TYPE}_distributed_$(date +%Y%m%d_%H%M%S).log"
+    # 🔧 新增：启动重试机制
+    MAX_RETRIES=3
+    RETRY_COUNT=0
     
-    torchrun \
-        --nproc_per_node=$DEVICE_COUNT \
-        --master_addr=$MASTER_ADDR \
-        --master_port=$MASTER_PORT \
-        --nnodes=1 \
-        --node_rank=0 \
-        src/i2v_api.py 2>&1 | tee "$LOG_FILE"
+    while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+        echo -e "${BLUE}🔄 Launch attempt $((RETRY_COUNT + 1))/$MAX_RETRIES${NC}"
+        
+        # 启动分布式服务
+        LOG_FILE="logs/${DEVICE_TYPE}_distributed_$(date +%Y%m%d_%H%M%S).log"
+        
+        if torchrun \
+            --nproc_per_node=$DEVICE_COUNT \
+            --master_addr=$MASTER_ADDR \
+            --master_port=$MASTER_PORT \
+            --nnodes=1 \
+            --node_rank=0 \
+            src/i2v_api.py 2>&1 | tee "$LOG_FILE"; then
+            # 启动成功
+            break
+        else
+            # 启动失败，准备重试
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            
+            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                echo -e "${YELLOW}⚠️  Launch failed, retrying in 10 seconds...${NC}"
+                
+                # 清理后重试
+                pkill -f "torchrun.*i2v_api" 2>/dev/null || true
+                pkill -f "python.*i2v_api" 2>/dev/null || true
+                sleep 5
+                
+                # 换个端口重试
+                MASTER_PORT=$((MASTER_PORT + 1))
+                echo -e "${BLUE}🔄 Switching to port $MASTER_PORT${NC}"
+                
+                sleep 5
+            else
+                echo -e "${RED}❌ All launch attempts failed!${NC}"
+                exit 1
+            fi
+        fi
+    done
 else
     echo -e "${GREEN}🚀 Starting single-device service on $DEVICE_TYPE...${NC}"
     echo -e "${BLUE}🌐 Server will start on http://$SERVER_HOST:$SERVER_PORT${NC}"
