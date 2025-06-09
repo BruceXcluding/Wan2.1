@@ -1,3 +1,7 @@
-from .device_detector import device_detector, DeviceType, DeviceDetector
+"""
+工具包
+"""
 
-__all__ = ["device_detector", "DeviceType", "DeviceDetector"]
+from utils.device_detector import device_detector, DeviceDetector, DeviceType
+
+__all__ = ["device_detector", "DeviceDetector", "DeviceType"]
