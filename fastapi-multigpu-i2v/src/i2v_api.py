@@ -1,86 +1,131 @@
-#!/usr/bin/env python3
 """
 FastAPI Multi-GPU I2V API Server
-完整的分布式视频生成服务
 """
-import os
 import sys
-import time
+import os
 import logging
 import asyncio
 import uuid
-from datetime import datetime
-from typing import Dict, Any, Optional, List
+from pathlib import Path
+from typing import Dict, Any, Optional
+import time
+import json
 from contextlib import asynccontextmanager
 import traceback
+from datetime import datetime
 
-# 添加项目路径到 Python path
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
+# 确保能找到项目根目录的 utils - 在所有其他导入之前
+def setup_project_paths():
+    """设置项目路径，确保能找到所有模块"""
+    current_file = Path(__file__).resolve()
+    
+    # 计算路径：src/i2v_api.py -> 项目根目录
+    project_root = current_file.parent.parent
+    src_root = current_file.parent
+    utils_root = project_root / "utils"
+    
+    # 要添加的路径列表
+    paths_to_add = [
+        str(project_root),      # 项目根目录
+        str(src_root),          # src 目录  
+        str(utils_root)         # utils 目录（直接添加）
+    ]
+    
+    # 添加到 sys.path，避免重复
+    for path in paths_to_add:
+        if os.path.exists(path) and path not in sys.path:
+            sys.path.insert(0, path)
+    
+    return project_root, src_root, utils_root
 
-# 分布式环境变量
-rank = int(os.environ.get('RANK', 0))
-world_size = int(os.environ.get('WORLD_SIZE', 1))
-local_rank = int(os.environ.get('LOCAL_RANK', 0))
+# 设置路径
+project_root, src_root, utils_root = setup_project_paths()
 
-print(f"🚀 I2V API Server - Rank {rank}/{world_size}")
+# PyTorch 相关导入
+import torch
+import torch.distributed as dist
+
+# FastAPI 相关导入
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles  # 添加这个导入
+import uvicorn
+
+# 导入项目模块 - 使用修复的导入方式
+from schemas import (
+    VideoSubmitRequest, VideoSubmitResponse,
+    VideoStatusRequest, VideoStatusResponse,
+    VideoCancelRequest, VideoCancelResponse,
+    TaskStatus, VideoResults, HealthResponse, MetricsResponse
+)
+
+from pipelines import PipelineFactory, get_available_pipelines
+
+# 导入设备检测器 - 多种导入方式，确保成功
+device_detector = None
+DeviceType = None
 
 try:
-    # 配置日志
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-    logger = logging.getLogger(__name__)
-    
-    # 核心导入
-    import torch
-    import torch.distributed as dist
-    import uvicorn
-    from fastapi import FastAPI, HTTPException, Request
-    from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.staticfiles import StaticFiles
-    from fastapi.responses import JSONResponse
-    
-    # 项目模块导入 - 正确的导入方式
-    from schemas import (
-        VideoSubmitRequest,
-        VideoSubmitResponse,
-        VideoStatusRequest,
-        VideoStatusResponse,
-        VideoCancelRequest,
-        VideoCancelResponse,
-        TaskStatus,
-        VideoResults,
-        HealthResponse,
-        MetricsResponse
-    )
-    
-    from pipelines import PipelineFactory, get_available_pipelines
-    from utils import device_detector  # 注意这是外层的utils
-    
-    print("✅ All modules imported successfully")
-    print(f"📦 Available pipelines: {get_available_pipelines()}")
-    
-except Exception as e:
-    print(f"❌ Import failed: {e}")
-    import traceback
-    traceback.print_exc()
-    sys.exit(1)
+    # 方法1：标准导入
+    from utils.device_detector import device_detector, DeviceType
+except ImportError:
+    try:
+        # 方法2：直接导入
+        import device_detector as dd
+        device_detector = dd.device_detector
+        DeviceType = dd.DeviceType
+    except ImportError:
+        try:
+            # 方法3：从 utils 包导入
+            from utils import device_detector as dd
+            device_detector = dd.device_detector  
+            DeviceType = dd.DeviceType
+        except ImportError as e:
+            # 如果都失败了，打印调试信息并退出
+            print(f"❌ Failed to import device_detector in i2v_api.py: {e}")
+            print(f"Project root: {project_root}")
+            print(f"Utils root: {utils_root}")
+            print(f"Utils exists: {utils_root.exists()}")
+            print(f"device_detector.py exists: {(utils_root / 'device_detector.py').exists()}")
+            print(f"Current sys.path: {sys.path[:5]}")
+            print(f"Current working directory: {os.getcwd()}")
+            sys.exit(1)
 
-# ... 其余代码保持不变 ...
+# 设置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# 分布式相关全局变量
+rank = int(os.environ.get("RANK", 0))
+local_rank = int(os.environ.get("LOCAL_RANK", 0))
+world_size = int(os.environ.get("WORLD_SIZE", 1))
+startup_time = time.time()
+
+# 服务统计
+service_stats = {
+    "total_tasks": 0,
+    "successful_tasks": 0,
+    "failed_tasks": 0,
+    "cancelled_tasks": 0
+}
 
 # 全局变量
 pipeline = None
-startup_time = time.time()
-service_stats = {
-    'total_tasks': 0,
-    'successful_tasks': 0,
-    'failed_tasks': 0,
-    'cancelled_tasks': 0
+task_manager = None
+app_metrics = {
+    "start_time": time.time(),
+    "total_requests": 0,
+    "active_tasks": 0,
+    "completed_tasks": 0,
+    "failed_tasks": 0,
+    "total_generation_time": 0.0
 }
 
+# 视频生成服务类
 class VideoService:
     """视频生成服务"""
     
@@ -277,9 +322,16 @@ def init_distributed():
         return True
     
     try:
-        # 检测设备类型
-        device_type, device_count = device_detector.detect_device()
-        
+        # 检测设备类型 - 添加错误处理
+        try:
+            device_type, device_count = device_detector.detect_device()
+            logger.info(f"Detected device: {device_type.value} x {device_count}")
+        except Exception as e:
+            logger.error(f"Device detection failed: {e}")
+            # 使用 CPU 作为备用
+            device_type = device_detector.DeviceType.CPU  # 或者导入 DeviceType
+            device_count = 1
+     
         # 设置后端
         if device_type.value == "npu":
             import torch_npu
@@ -388,7 +440,12 @@ app.mount("/videos", StaticFiles(directory="generated_videos"), name="videos")
 @app.get("/health")
 async def health_check():
     """健康检查"""
-    device_type, device_count = device_detector.detect_device()
+    try:
+        device_type, device_count = device_detector.detect_device()
+    except Exception as e:
+        logger.warning(f"Device detection failed in health check: {e}")
+        device_type = None
+        device_count = 0
     
     return HealthResponse(
         status="healthy" if video_service else "initializing",
@@ -398,7 +455,7 @@ async def health_check():
             "rank": rank,
             "world_size": world_size,
             "local_rank": local_rank,
-            "device_type": device_type.value,
+            "device_type": device_type.value if device_type else "unknown",
             "device_count": device_count
         },
         service=await video_service.get_service_stats() if video_service else {},

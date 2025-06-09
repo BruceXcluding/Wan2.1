@@ -100,18 +100,34 @@ class DistributedMixin:
 
 class ModelLoaderMixin:
     """模型加载功能混入类"""
-    
     def _load_model_common(self, model_config: Dict[str, Any]):
         """通用模型加载逻辑"""
         try:
+            # 确保能找到 wan 模块
+            import sys
+            from pathlib import Path
+
+            # 添加 wan 模块路径
+            current_file = Path(__file__).resolve()
+            project_root = current_file.parent.parent.parent  # src/pipelines/ -> src/ -> project_root/
+            wan_project_root = project_root.parent  # 上一级目录，即 /workspace/Wan2.1
+
+            if str(wan_project_root) not in sys.path:
+                sys.path.insert(0, str(wan_project_root))
+                logger.info(f"Added wan project path: {wan_project_root}")
+
+            # 导入 wan 模块
             import wan
+            logger.info("✅ Successfully imported wan module")
+
+            # 获取配置
             cfg = wan.configs.WAN_CONFIGS[model_config.get("task", "i2v-14B")]
-            
+
             max_retries = 3
             for attempt in range(max_retries):
                 try:
                     logger.info(f"Rank {self.rank}: Loading {self.device_type} model attempt {attempt + 1}/{max_retries}")
-                    
+
                     model = wan.WanI2V(
                         config=cfg,
                         checkpoint_dir=self.ckpt_dir,
@@ -119,28 +135,41 @@ class ModelLoaderMixin:
                         rank=self.rank,
                         **model_config
                     )
-                    
+
                     # 设备特定的模型配置
                     self._configure_model(model)
-                    
+
                     # T5 CPU模式预热
                     if self.t5_cpu:
                         self._warmup_t5_cpu(model)
-                    
+
                     logger.info(f"Rank {self.rank}: {self.device_type} model loaded successfully")
                     return model
-                    
+
                 except Exception as e:
                     logger.warning(f"Rank {self.rank}: Model loading attempt {attempt + 1} failed: {str(e)}")
                     if attempt == max_retries - 1:
                         raise
                     
                     time.sleep(5 * (attempt + 1))  # 递增延迟
-            
+
+        except ImportError as e:
+            logger.error(f"❌ Failed to import wan module: {e}")
+            logger.info(f"wan project root: {wan_project_root}")
+            logger.info(f"wan directory exists: {(wan_project_root / 'wan').exists()}")
+
+            # 列出可用的目录
+            if wan_project_root.exists():
+                logger.info("Available directories in wan project root:")
+                for item in wan_project_root.iterdir():
+                    if item.is_dir():
+                        logger.info(f"  - {item.name}")
+
+            raise
         except Exception as e:
             logger.error(f"Failed to load {self.device_type} model: {str(e)}")
             raise
-    
+        
     def _warmup_t5_cpu(self, model):
         """T5 CPU模式预热"""
         if not self.t5_cpu:

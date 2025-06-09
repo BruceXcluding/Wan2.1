@@ -1,4 +1,5 @@
 #!/bin/bash
+# filepath: /workspace/Wan2.1/fastapi-multigpu-i2v/scripts/start_service_general.sh
 """
 通用智能启动脚本 - 优化版
 自动检测硬件环境并启动最优配置
@@ -46,8 +47,28 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-16}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-16}"
 export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-16}"
 
-# Python 路径 - 确保项目路径在 Python path 中
-export PYTHONPATH="$PROJECT_ROOT:${PYTHONPATH:-}"
+# Python 路径 - 添加 wan 模块路径
+WAN_PROJECT_ROOT="$(dirname "$PROJECT_ROOT")"  # 上一级目录，即 /workspace/Wan2.1
+
+# 设置 PYTHONPATH，确保 wan 模块可被找到
+export PYTHONPATH="$WAN_PROJECT_ROOT:$PROJECT_ROOT:$PROJECT_ROOT/src:$PROJECT_ROOT/utils:${PYTHONPATH:-}"
+
+echo -e "${BLUE}📋 Python Path Configuration:${NC}"
+echo "  - WAN_PROJECT_ROOT: $WAN_PROJECT_ROOT"
+echo "  - PROJECT_ROOT: $PROJECT_ROOT"
+echo "  - PYTHONPATH (first 5 paths):"
+echo "$PYTHONPATH" | tr ':' '\n' | head -5 | sed 's/^/    /'
+
+# 验证 wan 模块
+echo -e "${BLUE}🔍 Verifying wan module...${NC}"
+if [ -d "$WAN_PROJECT_ROOT/wan" ]; then
+    echo -e "${GREEN}✅ wan module found at: $WAN_PROJECT_ROOT/wan${NC}"
+else
+    echo -e "${YELLOW}⚠️  wan module not found at: $WAN_PROJECT_ROOT/wan${NC}"
+fi
+
+# Python 路径 - 修改：确保 utils 目录直接可见
+export PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/src:$PROJECT_ROOT/utils:${PYTHONPATH:-}"
 
 echo -e "${BLUE}📋 General Configuration:${NC}"
 echo "  - Project Root: $PROJECT_ROOT"
@@ -59,17 +80,70 @@ echo "  - Max Concurrent: $MAX_CONCURRENT_TASKS"
 echo "  - Timeout: ${TASK_TIMEOUT}s"
 echo "  - Server: $SERVER_HOST:$SERVER_PORT"
 
+# 环境信息检查
+echo -e "${BLUE}🔍 Environment Information:${NC}"
+echo "  - Current Directory: $(pwd)"
+echo "  - Project Root: $PROJECT_ROOT"
+echo "  - Python Version: $(python3 --version)"
+
+# 检查项目结构
+echo -e "${BLUE}📁 Project Structure Check:${NC}"
+[ -d "$PROJECT_ROOT/src" ] && echo "  ✅ src/" || echo "  ❌ src/"
+[ -d "$PROJECT_ROOT/utils" ] && echo "  ✅ utils/" || echo "  ❌ utils/"
+[ -f "$PROJECT_ROOT/utils/device_detector.py" ] && echo "  ✅ utils/device_detector.py" || echo "  ❌ utils/device_detector.py"
+[ -f "$PROJECT_ROOT/utils/__init__.py" ] && echo "  ✅ utils/__init__.py" || echo "  ❌ utils/__init__.py"
+[ -d "$PROJECT_ROOT/src/schemas" ] && echo "  ✅ src/schemas/" || echo "  ❌ src/schemas/"
+[ -d "$PROJECT_ROOT/src/pipelines" ] && echo "  ✅ src/pipelines/" || echo "  ❌ src/pipelines/"
+
 # 检查模型路径
 if [ ! -d "$MODEL_CKPT_DIR" ]; then
     echo -e "${YELLOW}⚠️  Model directory not found: $MODEL_CKPT_DIR${NC}"
     echo -e "${YELLOW}   Continuing anyway (model will be downloaded if needed)${NC}"
 fi
 
+# 验证device_detector模块 - 修改：简化验证逻辑
+echo -e "${BLUE}📦 Verifying device detector...${NC}"
+python3 -c "
+import sys
+import os
+
+# 设置路径
+project_root = '$PROJECT_ROOT'
+paths = [project_root, os.path.join(project_root, 'src'), os.path.join(project_root, 'utils')]
+for p in paths:
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+print(f'Project root: {project_root}')
+
+try:
+    from utils.device_detector import device_detector
+    print('✅ device_detector import successful')
+    device_type, device_count = device_detector.detect_device()
+    print(f'Device detected: {device_type.value}:{device_count}')
+except Exception as e:
+    print(f'❌ device_detector import failed: {e}')
+    exit(1)
+"
+
+# 如果device_detector验证失败，退出
+if [[ $? -ne 0 ]]; then
+    echo -e "${RED}❌ Device detector verification failed!${NC}"
+    exit 1
+fi
+
 # 自动设备检测
 echo -e "${BLUE}🔍 Auto-detecting hardware environment...${NC}"
 DETECTED_DEVICE=$(python3 -c "
 import sys
-sys.path.insert(0, '$PROJECT_ROOT')
+import os
+# 设置路径
+project_root = '$PROJECT_ROOT'
+paths = [project_root, os.path.join(project_root, 'src'), os.path.join(project_root, 'utils')]
+for p in paths:
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
 try:
     from utils.device_detector import device_detector
     device_type, device_count = device_detector.detect_device()
@@ -104,12 +178,20 @@ elif [ "$DEVICE_TYPE" = "cuda" ]; then
     echo "  - NCCL Timeout: $NCCL_TIMEOUT"
 fi
 
-# 验证 Python 环境
+# 验证 Python 环境 - 修改：简化验证逻辑
 echo -e "${BLUE}🐍 Checking Python environment...${NC}"
 python3 -c "
 import sys
+import os
+
+# 设置路径
+project_root = '$PROJECT_ROOT'
+paths = [project_root, os.path.join(project_root, 'src'), os.path.join(project_root, 'utils')]
+for p in paths:
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
 print(f'Python: {sys.version}')
-sys.path.insert(0, '$PROJECT_ROOT')
 
 # 检查基础导入
 try:
@@ -127,15 +209,19 @@ try:
     # 检查项目模块
     from schemas import VideoSubmitRequest
     from pipelines import PipelineFactory, get_available_pipelines
-    from utils import device_detector
+    from utils.device_detector import device_detector
     print('✅ All project modules imported successfully')
     print(f'Available pipelines: {get_available_pipelines()}')
     
 except ImportError as e:
     print(f'❌ Import failed: {e}')
+    import traceback
+    traceback.print_exc()
     sys.exit(1)
 except Exception as e:
     print(f'⚠️  Environment check warning: {e}')
+    import traceback
+    traceback.print_exc()
 "
 
 if [ $? -ne 0 ]; then
@@ -144,15 +230,28 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-# 清理设备缓存
+# 清理设备缓存 - 修改：简化缓存清理逻辑
 echo -e "${BLUE}🗑️  Clearing device cache...${NC}"
 python3 -c "
+import sys
+import os
+
+# 设置路径
+project_root = '$PROJECT_ROOT'
+paths = [project_root, os.path.join(project_root, 'src'), os.path.join(project_root, 'utils')]
+for p in paths:
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
 try:
-    if '$DEVICE_TYPE' == 'npu':
+    from utils.device_detector import device_detector
+    device_type, _ = device_detector.detect_device()
+    
+    if device_type.value == 'npu':
         import torch_npu
         torch_npu.npu.empty_cache()
         print('✅ NPU cache cleared')
-    elif '$DEVICE_TYPE' == 'cuda':
+    elif device_type.value == 'cuda':
         import torch
         torch.cuda.empty_cache()
         print('✅ CUDA cache cleared')

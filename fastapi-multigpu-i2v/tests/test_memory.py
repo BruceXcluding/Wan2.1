@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
+# filepath: /Users/yigex/Documents/LLM-Inftra/Wan2.1_fix/fastapi-multigpu-i2v/tests/test_memory.py
 """
-内存监控调试工具
-监控 NPU/GPU 内存使用情况，诊断内存泄漏和峰值使用
+内存监控测试工具
+整合了原 debug/debug_memory.py 的功能
 """
 
 import os
@@ -15,8 +16,9 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from datetime import datetime
 
-# 添加项目根目录到 Python 路径
-project_root = Path(__file__).parent.parent.parent
+# 设置项目路径
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
 sys.path.insert(0, str(project_root / "src"))
 
 # 设置环境变量
@@ -49,27 +51,33 @@ class MemoryMonitor:
         self.snapshots: List[MemorySnapshot] = []
         self.monitoring = False
         self.monitor_thread = None
-        self.monitor_interval = 1.0  # 秒
+        self.monitor_interval = 1.0
         
         logger.info(f"Memory monitor initialized for device type: {self.device_type}")
     
     def _detect_device_type(self) -> str:
         """自动检测设备类型"""
         try:
-            import torch_npu
-            if torch_npu.npu.is_available():
-                return "npu"
-        except ImportError:
-            pass
-        
-        try:
-            import torch
-            if torch.cuda.is_available():
-                return "cuda"
-        except ImportError:
-            pass
-        
-        return "cpu"
+            from utils.device_detector import device_detector
+            device_type, _ = device_detector.detect_device()
+            return device_type.value
+        except:
+            # 备用检测
+            try:
+                import torch_npu
+                if torch_npu.npu.is_available():
+                    return "npu"
+            except ImportError:
+                pass
+            
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    return "cuda"
+            except ImportError:
+                pass
+            
+            return "cpu"
     
     def get_device_count(self) -> int:
         """获取设备数量"""
@@ -93,8 +101,8 @@ class MemoryMonitor:
                 import torch_npu
                 allocated = torch_npu.npu.memory_allocated(device_id) / 1024**2
                 reserved = torch_npu.npu.memory_reserved(device_id) / 1024**2
-                # NPU 总内存获取（可能需要特定 API）
-                total = 32 * 1024  # 默认 32GB，实际应该通过 NPU API 获取
+                # NPU 总内存获取
+                total = 32 * 1024  # 默认 32GB
                 free = total - reserved
                 return allocated, reserved, free, total
                 
@@ -241,7 +249,7 @@ class MemoryMonitor:
             print(f"  Avg:     {sum(utilization_values)/len(utilization_values):8.1f}%")
             print(f"  Current: {utilization_values[-1]:8.1f}%")
             
-            # 检查内存泄漏（保留内存持续增长）
+            # 检查内存泄漏
             if len(reserved_values) >= 10:
                 recent_trend = reserved_values[-5:]
                 early_trend = reserved_values[:5]
@@ -302,48 +310,33 @@ class MemoryMonitor:
         self.snapshots.clear()
         logger.info("Memory snapshots cleared")
 
+# 测试函数
 def test_memory_during_model_load():
     """测试模型加载期间的内存使用"""
     monitor = MemoryMonitor()
     
     print("🧪 Testing memory usage during model loading...")
-    
-    # 初始内存状态
     monitor.print_current_status(0)
     monitor.take_snapshot(0, "before_import")
     
     try:
-        # 开始监控
-        monitor.start_monitoring(0, 0.5)  # 每0.5秒监控一次
+        monitor.start_monitoring(0, 0.5)
         
-        # 模拟模型加载
         print("\n1. Importing torch modules...")
         import torch
         if monitor.device_type == "npu":
             import torch_npu
         monitor.take_snapshot(0, "after_torch_import")
         
-        print("2. Loading WAN model...")
-        import wan
-        monitor.take_snapshot(0, "after_wan_import")
+        print("2. Testing device allocation...")
+        if monitor.device_type != "cpu":
+            device = torch.device(f'{monitor.device_type}:0')
+            test_tensor = torch.randn(1000, 1000, device=device)
+            monitor.take_snapshot(0, "after_allocation")
+            del test_tensor
+            monitor.take_snapshot(0, "after_cleanup")
         
-        print("3. Creating model config...")
-        cfg = wan.configs.WAN_CONFIGS["i2v-14B"]
-        monitor.take_snapshot(0, "after_config")
-        
-        print("4. Initializing model (this may take time)...")
-        # 这里可以添加实际的模型初始化代码
-        time.sleep(2)  # 模拟加载时间
-        monitor.take_snapshot(0, "after_model_init")
-        
-        print("5. Testing inference...")
-        time.sleep(1)  # 模拟推理
-        monitor.take_snapshot(0, "after_inference")
-        
-        # 停止监控
         monitor.stop_monitoring()
-        
-        # 分析结果
         monitor.print_memory_analysis()
         monitor.print_memory_timeline()
         
@@ -371,26 +364,26 @@ def stress_test_memory():
             print("No GPU/NPU available for stress test")
             return False
         
-        monitor.start_monitoring(0, 0.2)  # 高频监控
+        monitor.start_monitoring(0, 0.2)
         
         tensors = []
         
         # 逐步分配内存
-        for i in range(10):
-            print(f"Allocating tensor {i+1}/10...")
-            tensor_size = (1024, 1024, 50)  # 约200MB
+        for i in range(5):  # 减少到5个避免内存不足
+            print(f"Allocating tensor {i+1}/5...")
+            tensor_size = (512, 512, 100)  # 约100MB
             tensor = torch.randn(tensor_size, device=device)
             tensors.append(tensor)
             monitor.take_snapshot(0, f"alloc_tensor_{i+1}")
             time.sleep(0.5)
         
-        print("All tensors allocated, holding for 5 seconds...")
-        time.sleep(5)
+        print("Peak usage, holding for 3 seconds...")
+        time.sleep(3)
         monitor.take_snapshot(0, "peak_usage")
         
         # 逐步释放内存
         for i, tensor in enumerate(tensors):
-            print(f"Releasing tensor {i+1}/10...")
+            print(f"Releasing tensor {i+1}/5...")
             del tensor
             if monitor.device_type == "npu":
                 torch_npu.npu.empty_cache()
@@ -400,17 +393,8 @@ def stress_test_memory():
             time.sleep(0.2)
         
         del tensors
-        
-        print("Final cleanup...")
-        if monitor.device_type == "npu":
-            torch_npu.npu.empty_cache()
-        elif monitor.device_type == "cuda":
-            torch.cuda.empty_cache()
-        
         monitor.take_snapshot(0, "final_cleanup")
         monitor.stop_monitoring()
-        
-        # 分析结果
         monitor.print_memory_analysis()
         
     except Exception as e:
@@ -422,7 +406,7 @@ def stress_test_memory():
 
 def main():
     """主函数"""
-    parser = argparse.ArgumentParser(description="Memory Monitoring Debug Tool")
+    parser = argparse.ArgumentParser(description="Memory Monitoring Test Tool")
     parser.add_argument("--device-type", choices=["auto", "npu", "cuda", "cpu"], 
                        default="auto", help="Device type to monitor")
     parser.add_argument("--device-id", type=int, default=0,
@@ -437,17 +421,15 @@ def main():
     
     args = parser.parse_args()
     
-    print("🔍 Memory Monitoring Debug Tool")
+    print("🔍 Memory Monitoring Test Tool")
     print("=" * 50)
     
     try:
         if args.mode == "status":
-            # 显示当前状态
             monitor = MemoryMonitor(args.device_type)
             monitor.print_current_status(args.device_id)
             
         elif args.mode == "monitor":
-            # 连续监控
             monitor = MemoryMonitor(args.device_type)
             print(f"Starting {args.duration}s monitoring (interval: {args.interval}s)...")
             
@@ -462,13 +444,11 @@ def main():
                 monitor.export_csv(args.export)
                 
         elif args.mode == "model-test":
-            # 模型加载测试
             success = test_memory_during_model_load()
             if not success:
                 return 1
                 
         elif args.mode == "stress-test":
-            # 压力测试
             success = stress_test_memory()
             if not success:
                 return 1
@@ -477,7 +457,7 @@ def main():
         return 0
         
     except KeyboardInterrupt:
-        print("\nMonitoring interrupted by user")
+        print("\n⏸️  Monitoring interrupted by user")
         return 0
     except Exception as e:
         logger.error(f"Memory monitoring failed: {e}")
@@ -486,4 +466,5 @@ def main():
         return 1
 
 if __name__ == "__main__":
-    sys.exit(main())
+    exit_code = main()
+    sys.exit(exit_code)

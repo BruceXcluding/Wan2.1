@@ -50,7 +50,7 @@ __all__.extend(["get_available_pipelines", "get_pipeline_class"])
 
 # 版本信息
 __version__ = "1.0.0"
-__author__ = "Multi-GPU I2V Team"
+__author__ = "BruceXcluding"
 __description__ = "Multi-hardware backend pipelines for video generation"
 
 logger.info(f"Pipelines package initialized. Available: {get_available_pipelines()}")

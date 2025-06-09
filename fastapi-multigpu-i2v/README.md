@@ -42,20 +42,20 @@ fastapi-multigpu-i2v/
 ├── scripts/                          # 📜 启动脚本
 │   ├── start_service_npu.sh          # NPU 专用启动脚本 (优化版)
 │   ├── start_service_cuda.sh         # CUDA 专用启动脚本 (新增)
-│   ├── start_service_general.sh      # 通用智能启动脚本 (优化版)
-│   └── debug/                        # 🔍 调试工具集
-│       ├── README.md                 # 调试工具使用指南
-│       ├── debug_device.py           # 设备检测调试 (完整版)
-│       ├── debug_pipeline.py         # 管道调试 (完整版)
-│       ├── debug_memory.py           # 内存监控调试
-│       └── debug_t5_warmup.py        # T5 预热调试
+│   └── start_service_general.sh      # 通用智能启动脚本 (优化版)
+├── tests/                            # ✅ 测试与调试工具集
+│   ├── README.md                     # 测试工具使用指南
+│   ├── test_env.py                   # 环境检测测试 (完整版)
+│   ├── test_device_detailed.py       # 设备检测详细测试
+│   ├── test_memory.py                # 内存监控测试
+│   ├── test_pipeline.py              # 管道系统测试
+│   └── test_warmup.py                # T5 预热测试
 ├── tools/                            # 🛠️ 开发工具集
 │   ├── README.md                     # 开发工具使用指南
 │   ├── verify_structure.py           # 项目结构验证 (完整版)
 │   ├── config_generator.py           # 智能配置生成器 (完整版)
 │   ├── benchmark.py                  # 性能基准测试
 │   └── health_monitor.py             # 健康监控工具
-├── tests/                            # ✅ 测试用例
 ├── docs/                             # 📚 项目文档
 ├── generated_videos/                 # 📹 生成视频存储
 ├── logs/                             # 📝 日志文件
@@ -100,8 +100,11 @@ cd fastapi-multigpu-i2v
 # 🔍 完整项目验证 (推荐首次运行)
 python3 tools/verify_structure.py
 
-# 🎯 快速设备检测
-python3 scripts/debug/debug_device.py
+# 🎯 快速环境检测
+python3 tests/test_env.py --quick
+
+# 🖥️ 详细设备检测
+python3 tests/test_device_detailed.py
 
 # 📦 检查可用管道
 python3 -c "from pipelines import get_available_pipelines; print(f'Available: {get_available_pipelines()}')"
@@ -166,17 +169,23 @@ pip install -r requirements.txt
 python3 scripts/debug/debug_device.py
 ```
 
-### 5. 预启动调试 (推荐)
+### 5. 预启动测试 (推荐)
 
 ```bash
-# 🧪 T5 预热测试 (T5 CPU 模式重要)
-python3 scripts/debug/debug_t5_warmup.py --warmup-steps 3
+# 🧪 快速环境检查
+python3 tests/test_env.py --quick
 
-# 🧠 内存状态检查
-python3 scripts/debug/debug_memory.py --mode status
+# 🖥️ 详细设备检测和性能测试
+python3 tests/test_device_detailed.py
+
+# 🧠 内存状态检查和监控
+python3 tests/test_memory.py --mode status
 
 # 🔗 管道创建测试
-python3 scripts/debug/debug_pipeline.py --mode quick
+python3 tests/test_pipeline.py --mode quick
+
+# 🧪 T5 预热测试 (T5 CPU 模式重要)
+python3 tests/test_warmup.py --warmup-steps 3
 
 # 📊 系统资源检查
 python3 tools/health_monitor.py --mode check
@@ -233,71 +242,85 @@ open http://localhost:8088/docs
 python3 tools/health_monitor.py --mode monitor --duration 3600 &
 ```
 
-## 🔍 调试工具详解
+## 🧪 测试工具详解
 
-### 设备检测调试
+### 环境检测测试
 ```bash
-# 🎯 完整设备检测 (包含内存测试和兼容性检查)
-python3 scripts/debug/debug_device.py
+# 🔍 完整环境检测 (包含项目结构、模块导入、硬件检测)
+python3 tests/test_env.py
+
+# 🚀 快速环境检查 (仅检查关键功能)
+python3 tests/test_env.py --quick
 
 # 输出示例：
-# ✅ Detected device: npu
-# ✅ Device count: 8
+# ✅ Device detection: npu x 8
+# ✅ Available pipelines: ['base', 'npu']
+# 🎉 All tests PASSED! System ready.
+```
+
+### 设备详细测试
+```bash
+# 🖥️ 完整设备检测 (包含内存测试和兼容性检查)
+python3 tests/test_device_detailed.py
+
+# 输出示例：
+# ✅ Detected device: npu x 8
 # ✅ Backend: torch_npu
 # 📊 Device Details...
 # 🧠 Memory Operations Test...
 # 🔗 Pipeline Compatibility...
+# ⚡ Performance Benchmark...
 ```
 
-### T5 预热调试 (重要!)
+### T5 预热测试 (重要!)
 ```bash
 # 🧠 T5 CPU 模式预热测试 (首次启动前推荐)
-python3 scripts/debug/debug_t5_warmup.py --warmup-steps 3
+python3 tests/test_warmup.py --warmup-steps 3
 
 # 🎛️ 自定义测试参数
-python3 scripts/debug/debug_t5_warmup.py \
+python3 tests/test_warmup.py \
   --model-path /path/to/model \
   --warmup-steps 5 \
   --skip-resource-check
 
 # 输出示例：
-# 🔍 T5 Warmup Debug Tool
+# 🔍 T5 Warmup Test Tool
 # ✅ T5 warmup completed successfully
 # 📊 Warmup time: 45.2s
 # 🧠 Memory usage: 12.5GB
 ```
 
-### 内存监控调试
+### 内存监控测试
 ```bash
 # 📊 查看当前内存状态
-python3 scripts/debug/debug_memory.py --mode status
+python3 tests/test_memory.py --mode status
 
 # 📈 连续监控 60 秒
-python3 scripts/debug/debug_memory.py --mode monitor --duration 60 --interval 5
+python3 tests/test_memory.py --mode monitor --duration 60 --interval 5
 
 # 🧪 模型加载内存测试
-python3 scripts/debug/debug_memory.py --mode model-test
+python3 tests/test_memory.py --mode model-test
 
 # 💥 内存压力测试
-python3 scripts/debug/debug_memory.py --mode stress-test
+python3 tests/test_memory.py --mode stress-test
 
 # 📋 导出监控数据
-python3 scripts/debug/debug_memory.py \
+python3 tests/test_memory.py \
   --mode monitor \
   --duration 300 \
   --export memory_monitor.csv
 ```
 
-### 管道系统调试
+### 管道系统测试
 ```bash
 # 🔧 快速管道测试
-python3 scripts/debug/debug_pipeline.py --mode quick
+python3 tests/test_pipeline.py --mode quick
 
 # 🧪 综合管道测试 (包含模型加载)
-python3 scripts/debug/debug_pipeline.py --mode comprehensive
+python3 tests/test_pipeline.py --mode comprehensive
 
 # 🎛️ 自定义模型路径测试
-python3 scripts/debug/debug_pipeline.py --model-path /path/to/model
+python3 tests/test_pipeline.py --model-path /path/to/model
 
 # 输出示例：
 # 🔧 Pipeline Creation Test
@@ -306,14 +329,19 @@ python3 scripts/debug/debug_pipeline.py --model-path /path/to/model
 # ✅ Memory logging works
 ```
 
-### 调试工具批量运行
+### 测试工具批量运行
 ```bash
-# 📋 运行所有核心调试检查
-echo "🔍 Running comprehensive debug checks..."
-python3 scripts/debug/debug_device.py && \
-python3 scripts/debug/debug_memory.py --mode status && \
-python3 scripts/debug/debug_pipeline.py --mode quick && \
-echo "✅ All debug checks completed!"
+# 📋 运行所有核心测试检查
+echo "🔍 Running comprehensive test suite..."
+python3 tests/test_env.py && \
+python3 tests/test_device_detailed.py && \
+python3 tests/test_memory.py --mode status && \
+python3 tests/test_pipeline.py --mode quick && \
+echo "✅ All tests completed!"
+
+# 🚀 快速验证流程 (适合日常检查)
+python3 tests/test_env.py --quick && \
+echo "✅ Quick validation passed!"
 ```
 
 ## 🛠️ 开发工具详解
@@ -1147,20 +1175,11 @@ python3 tools/verify_structure.py
 
 # 2. 设备环境检查  
 echo "🔧 Checking device environment..."
-python3 scripts/debug/debug_device.py
+python3 tests/test_device_detailed.py
 
-# 3. 依赖检查
-echo "📦 Checking dependencies..."
-python3 -c "
-try:
-    import torch, fastapi, uvicorn
-    from schemas import VideoSubmitRequest
-    from pipelines import PipelineFactory
-    from utils import device_detector
-    print('✅ All imports successful')
-except ImportError as e:
-    print(f'❌ Import failed: {e}')
-"
+# 3. 快速环境验证
+echo "🚀 Quick environment check..."
+python3 tests/test_env.py --quick
 
 # 4. 模型路径检查
 echo "📁 Checking model path..."
@@ -1175,12 +1194,12 @@ fi
 #### 🧠 内存问题诊断
 ```bash
 # 1. 当前内存状态
-python3 scripts/debug/debug_memory.py --mode status
+python3 tests/test_memory.py --mode status
 
 # 2. T5 CPU 模式检查
 if [ "$T5_CPU" = "true" ]; then
     echo "✅ T5 CPU mode enabled"
-    python3 scripts/debug/debug_t5_warmup.py --warmup-steps 1
+    python3 tests/test_warmup.py --warmup-steps 1
 else
     echo "⚠️  T5 GPU mode - high memory usage expected"
 fi
@@ -1553,35 +1572,36 @@ pip install -r requirements-dev.txt
 
 # 4. 验证开发环境
 python3 tools/verify_structure.py
-python3 scripts/debug/debug_device.py
+python3 tests/test_env.py --quick
 
-# 5. 运行测试
-python3 -m pytest tests/ -v
+# 5. 运行测试套件
+python3 tests/test_env.py
+python3 tests/test_device_detailed.py
 ```
 
 ### 代码质量检查
 ```bash
 # 代码格式化
-black src/ tools/ scripts/debug/
-isort src/ tools/ scripts/debug/
+black src/ tools/ tests/
+isort src/ tools/ tests/
 
 # 类型检查
 mypy src/
 
 # 测试覆盖率
-pytest --cov=src --cov-report=html tests/
+pytest tests/ -v --cov=src --cov-report=html
 
 # 代码质量
-flake8 src/ tools/
-pylint src/ tools/
+flake8 src/ tools/ tests/
+pylint src/ tools/ tests/
 ```
 
-### 提交规范
+### 提交前检查
 ```bash
-# 提交前检查
+# 提交前完整检查
 python3 tools/verify_structure.py
-python3 -m pytest tests/
-black --check src/ tools/
+python3 tests/test_env.py
+black --check src/ tools/ tests/
 
 # 提交格式
 git commit -m "feat: add amazing feature
@@ -1641,7 +1661,7 @@ python3 tools/verify_structure.py || exit 1
 
 # 2. 设备检测
 echo "2️⃣ Detecting hardware..."
-python3 scripts/debug/debug_device.py || exit 1
+python3 tests/test_device_detailed.py || exit 1
 
 # 3. 生成配置
 echo "3️⃣ Generating optimal configuration..."
@@ -1649,7 +1669,7 @@ python3 tools/config_generator.py --template production --export-env --output-di
 
 # 4. 预热测试
 echo "4️⃣ Running warmup test..."
-python3 scripts/debug/debug_t5_warmup.py --warmup-steps 1
+python3 tests/test_warmup.py --warmup-steps 1
 
 # 5. 启动服务
 echo "5️⃣ Starting service..."
