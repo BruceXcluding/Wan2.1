@@ -1,476 +1,404 @@
 # FastAPI Multi-GPU Video Generation API
 
-基于 Wan2.1-I2V-14B-720P 模型的多卡分布式视频生成 API 服务，支持图像到视频（Image-to-Video）生成。采用模块化架构设计，支持华为昇腾 NPU 8卡分布式推理。
+基于 Wan2.1-I2V-14B-720P 模型的多卡分布式视频生成 API 服务，支持图像到视频（Image-to-Video）生成。采用模块化架构设计，支持华为昇腾 NPU 和 NVIDIA GPU 多卡分布式推理。
 
 ## 🚀 项目特色
 
-- **🎯 多卡分布式**：支持 NV GPU, 华为昇腾 NPU 8卡并行推理
-- **🧠 T5 CPU 模式**：支持 T5 文本编码器在 CPU 上运行，节省 NPU 显存
-- **🔄 异步处理**：基于 FastAPI 的异步任务队列
+- **🎯 多卡分布式**：支持 NPU/GPU 8卡并行推理，自动设备检测
+- **🧠 T5 CPU 模式**：支持 T5 文本编码器在 CPU 上运行，节省显存
+- **🔄 异步处理**：基于 FastAPI 的异步任务队列和状态管理
 - **🧩 模块化架构**：清晰的分层设计，易于维护和扩展
 - **⚡ 性能优化**：注意力缓存、VAE并行等多种加速技术
-- **📊 任务管理**：完整的任务状态跟踪和队列管理
+- **📊 任务管理**：完整的任务生命周期管理和队列控制
 - **🛡️ 容错机制**：健壮的错误处理和资源清理
 - **🔒 企业级安全**：资源限制、并发控制、异常处理
-- **📈 监控运维**：详细指标、健康检查、自动清理
-- **🎛️ 灵活配置**：通过环境变量灵活控制各项参数
+- **📈 监控运维**：健康检查、性能监控、调试工具
+- **🎛️ 灵活配置**：配置生成器、环境预设、参数验证
 
 ## 📁 项目结构
 
 ```
-src/
-├── schemas/
+fastapi-multigpu-i2v/
+├── src/                              # 🎯 核心源码
 │   ├── __init__.py
-│   └── video.py              # 数据模型定义（请求/响应）
-├── services/
-│   ├── __init__.py
-│   └── video_service.py      # 业务逻辑层（任务管理）
-├── multigpu_pipeline.py      # 推理管道（分布式模型）
-└── i2v_api.py               # API 接口层（FastAPI 应用）
-generated_videos/             # 生成的视频文件存储
-start_service.sh             # 灵活的启动脚本
-requirements.txt              # 项目依赖
-README.md                     # 项目文档
+│   ├── i2v_api.py                    # FastAPI 主应用
+│   ├── schemas/                      # 📋 数据模型
+│   │   ├── __init__.py
+│   │   └── video.py                  # 请求/响应模型定义
+│   ├── services/                     # 🔧 业务逻辑层
+│   │   ├── __init__.py
+│   │   └── video_service.py          # 任务管理服务
+│   ├── pipelines/                    # 🚀 推理管道
+│   │   ├── __init__.py
+│   │   ├── base_pipeline.py          # 管道基类
+│   │   ├── npu_pipeline.py           # NPU 管道实现
+│   │   ├── cuda_pipeline.py          # CUDA 管道实现
+│   │   └── pipeline_factory.py       # 管道工厂
+│   └── utils/                        # 🛠️ 工具类
+│       ├── __init__.py
+│       └── device_detector.py        # 设备自动检测
+├── scripts/                          # 📜 启动脚本
+│   ├── start_service_npu.sh          # NPU 专用启动脚本
+│   ├── start_service_cuda.sh         # CUDA 专用启动脚本
+│   ├── start_service_general.sh      # 通用启动脚本
+│   └── debug/                        # 🔍 调试工具
+│       ├── debug_t5_warmup.py        # T5 预热调试
+│       ├── debug_pipeline.py         # 管道调试
+│       ├── debug_device.py           # 设备检测调试
+│       └── debug_memory.py           # 内存监控调试
+├── tools/                            # 🛠️ 开发工具
+│   ├── verify_structure.py           # 项目结构验证
+│   ├── benchmark.py                  # 性能基准测试
+│   ├── health_monitor.py             # 健康监控工具
+│   └── config_generator.py           # 配置生成器
+├── tests/                            # ✅ 测试用例
+├── docs/                             # 📚 项目文档
+├── generated_videos/                 # 📹 生成视频存储
+├── logs/                             # 📝 日志文件
+├── requirements.txt                  # 依赖清单
+└── README.md                         # 项目文档
 ```
 
 ## 🔧 环境要求
 
-### 硬件要求
-- **NPU**：华为昇腾 NPU × 8 卡
-- **内存**：32GB+ 系统内存（T5 CPU 模式需要更多系统内存）
-- **存储**：100GB+ 可用空间
+### 硬件支持
 
-### 显存配置建议
+#### NPU (华为昇腾)
+- **设备型号**：910B1/910B2/910B4 等昇腾芯片
+- **显存要求**：单卡 24GB+ (T5 CPU 模式) / 32GB+ (标准模式)
+- **驱动版本**：CANN 8.0+
 
-| NPU 型号 | 单卡显存 | 推荐配置 | T5 位置 | 并发任务 |
-|----------|----------|----------|---------|----------|
-| 910B1 | 32GB | 标准模式 | NPU | 3-5 |
-| 910B2 | 24GB | T5 CPU 模式 | CPU | 2-3 |
-| 910B4 | 32GB | 两种模式均可 | NPU/CPU | 2-5 |
+#### GPU (NVIDIA)
+- **设备型号**：RTX 3090/4090, A100, H100 等
+- **显存要求**：单卡 24GB+ (推荐 32GB+)
+- **驱动版本**：CUDA 11.8+ / CUDA 12.0+
+
+### 系统要求
+- **CPU**：16+ 核心 (T5 CPU 模式建议 32+ 核心)
+- **内存**：64GB+ 系统内存 (T5 CPU 模式需要更多)
+- **存储**：200GB+ 可用空间 (模型 + 输出视频)
+- **操作系统**：Linux (推荐 Ubuntu 20.04+)
 
 ### 软件环境
-- **Python**：3.11+
-- **CANN**：华为昇腾 CANN 驱动
-- **torch_npu**：PyTorch NPU 扩展
+- **Python**：3.10+
+- **PyTorch**：2.0+
+- **设备扩展**：torch_npu (NPU) / torch (CUDA)
 
-## 🛠️ 安装部署
+## 🛠️ 快速开始
 
-### 1. 环境配置
+### 1. 项目验证
 
 ```bash
-# 设置核心环境变量
+# 克隆项目
+git clone <repository-url>
+cd fastapi-multigpu-i2v
+
+# 验证项目结构
+python3 tools/verify_structure.py
+
+# 检测设备环境
+python3 scripts/debug/debug_device.py
+```
+
+### 2. 环境配置
+
+#### 自动配置生成
+```bash
+# 自动生成最优配置
+python3 tools/config_generator.py --preset production
+
+# 为开发环境生成配置
+python3 tools/config_generator.py --preset development --output .env.dev
+
+# 为内存受限环境生成配置
+python3 tools/config_generator.py --preset memory_efficient
+```
+
+#### 手动环境配置
+```bash
+# NPU 环境变量
 export ALGO=0
 export PYTORCH_NPU_ALLOC_CONF='expandable_segments:True'
 export TASK_QUEUE_ENABLE=2
-export CPU_AFFINITY_CONF=1
-export TOKENIZERS_PARALLELISM=false
+export HCCL_TIMEOUT=3600
 
-# 分布式通信配置
+# CUDA 环境变量
+export NCCL_TIMEOUT=3600
+export CUDA_LAUNCH_BLOCKING=0
+
+# 通用配置
+export TOKENIZERS_PARALLELISM=false
 export MASTER_ADDR=127.0.0.1
 export MASTER_PORT=29500
-
-# 服务配置（可选）
-export SERVER_HOST=0.0.0.0
-export SERVER_PORT=8088
-export MAX_CONCURRENT_TASKS=5
-export TASK_TIMEOUT=1800
-export CLEANUP_INTERVAL=300
-export MAX_OUTPUT_DIR_SIZE=50
-export ALLOWED_HOSTS="*"
-
-# 模型配置（可选）
-export MODEL_CKPT_DIR="/data/models/modelscope/hub/Wan-AI/Wan2.1-I2V-14B-720P"
 ```
 
-### 2. 依赖安装
+### 3. 依赖安装
 
 ```bash
-# 安装 Python 依赖
+# 基础依赖
 pip install -r requirements.txt
 
-# 确保 torch_npu 正确安装
-python -c "import torch_npu; print(torch_npu.__version__)"
+# NPU 环境验证
+python3 -c "import torch_npu; print(f'NPU available: {torch_npu.npu.is_available()}')"
+
+# CUDA 环境验证
+python3 -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
 ```
 
-### 3. 模型准备
-
-确保模型文件位于指定路径：
-```
-/data/models/modelscope/hub/Wan-AI/Wan2.1-I2V-14B-720P/
-├── config.json
-├── model.safetensors
-└── ...
-```
-
-### 4. 启动服务
-
-#### 🎯 灵活启动脚本
-
-项目提供了灵活的启动脚本 `start_service.sh`，支持通过环境变量控制各项配置：
+### 4. 模型准备
 
 ```bash
-#!/bin/bash
-# 灵活的启动脚本，支持多种配置模式
+# 设置模型路径
+export MODEL_CKPT_DIR="/data/models/modelscope/hub/Wan-AI/Wan2.1-I2V-14B-720P"
 
-echo "Starting Wan2.1 I2V API with configurable options..."
-
-# 设置核心环境变量
-export ALGO=0
-export PYTORCH_NPU_ALLOC_CONF='expandable_segments:True'
-export TASK_QUEUE_ENABLE=2
-export CPU_AFFINITY_CONF=1
-export TOKENIZERS_PARALLELISM=false
-
-# 分布式通信配置
-export MASTER_ADDR=127.0.0.1
-export MASTER_PORT=29500
-
-# HCCL 基础配置
-export HCCL_TIMEOUT=1800           # 30分钟超时
-export HCCL_CONNECT_TIMEOUT=600    # 10分钟连接超时
-export HCCL_BUFFSIZE=512          # 缓冲区大小
-export ASCEND_LAUNCH_BLOCKING=0    # 异步模式
-export ASCEND_GLOBAL_LOG_LEVEL=1
-
-# NPU 配置
-export NPU_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-
-# ==================== 可配置选项 ====================
-
-# T5 CPU 模式 (true/false) - 关键配置
-export T5_CPU=${T5_CPU:-"false"}
-
-# 分布式配置
-export DIT_FSDP=${DIT_FSDP:-"true"}
-export T5_FSDP=${T5_FSDP:-"false"}
-export VAE_PARALLEL=${VAE_PARALLEL:-"true"}
-export ULYSSES_SIZE=${ULYSSES_SIZE:-"8"}
-
-# 业务配置
-if [ "$T5_CPU" = "true" ]; then
-    # T5 CPU 模式的优化配置
-    export MAX_CONCURRENT_TASKS=${MAX_CONCURRENT_TASKS:-"2"}
-    export TASK_TIMEOUT=${TASK_TIMEOUT:-"2400"}  # 40分钟
-    export HCCL_TIMEOUT=2400  # 延长 HCCL 超时
-    echo "T5 CPU mode enabled - optimized for memory-constrained NPUs"
-else
-    # 标准模式配置
-    export MAX_CONCURRENT_TASKS=${MAX_CONCURRENT_TASKS:-"5"}
-    export TASK_TIMEOUT=${TASK_TIMEOUT:-"1800"}  # 30分钟
-    echo "Standard mode - T5 on NPU"
-fi
-
-# 服务配置
-export SERVER_PORT=${SERVER_PORT:-"8088"}
-export MAX_OUTPUT_DIR_SIZE=${MAX_OUTPUT_DIR_SIZE:-"50"}
-
-# 模型路径
-export MODEL_CKPT_DIR=${MODEL_CKPT_DIR:-"/data/models/modelscope/hub/Wan-AI/Wan2.1-I2V-14B-720P"}
-
-# Python路径
-export PYTHONPATH=/workspace/Wan2.1:$PYTHONPATH
-
-# ==================== 显示配置 ====================
-
-echo "Configuration:"
-echo "  - T5 CPU mode: $T5_CPU"
-echo "  - DIT FSDP: $DIT_FSDP"
-echo "  - VAE Parallel: $VAE_PARALLEL"
-echo "  - Ulysses Size: $ULYSSES_SIZE"
-echo "  - Max Concurrent: $MAX_CONCURRENT_TASKS"
-echo "  - Task Timeout: $TASK_TIMEOUT seconds"
-echo "  - Server Port: $SERVER_PORT"
-echo "  - Model Path: $MODEL_CKPT_DIR"
-
-# ==================== 启动服务 ====================
-
-# 创建输出目录
-mkdir -p generated_videos
-
-# 清理旧进程
-echo "Cleaning up old processes..."
-pkill -f "i2v_api.py" || true
-pkill -f "torchrun.*i2v_api" || true
-sleep 5
-
-# 检查 NPU 状态
-echo "Checking NPU status..."
-npu-smi info
-
-# 清理NPU缓存
-echo "Clearing NPU cache..."
-python3 -c "import torch_npu; torch_npu.npu.empty_cache(); print('NPU cache cleared')" || true
-
-# 启动服务
-echo "Starting 8-card distributed service..."
-torchrun \
-    --nproc_per_node=8 \
-    --master_addr=${MASTER_ADDR} \
-    --master_port=${MASTER_PORT} \
-    src/i2v_api.py
-
-echo "Service stopped."
+# 验证模型文件
+ls -la $MODEL_CKPT_DIR/
 ```
 
-#### 🎛️ 启动模式选择
+### 5. 启动服务
 
-**1. 标准模式（T5 在 NPU）**
+#### 🚀 智能启动 (推荐)
 ```bash
-# 适用于大显存 NPU（如 910B1 32GB）
-chmod +x start_service.sh
-T5_CPU=false ./start_service.sh
+# 自动检测设备并启动最优配置
+chmod +x scripts/start_service_general.sh
+./scripts/start_service_general.sh
 ```
 
-**2. T5 CPU 模式（节省显存）**
+#### 🎯 设备专用启动
 ```bash
-# 适用于小显存 NPU（如 910B2 24GB）
-T5_CPU=true ./start_service.sh
+# NPU 专用启动 (华为昇腾)
+chmod +x scripts/start_service_npu.sh
+./scripts/start_service_npu.sh
+
+# GPU 专用启动 (NVIDIA CUDA)
+chmod +x scripts/start_service_cuda.sh  
+./scripts/start_service_cuda.sh
 ```
 
-**3. 完全自定义配置**
+#### 🎛️ 自定义配置启动
 ```bash
-# 完全自定义所有参数
-T5_CPU=true \
-DIT_FSDP=true \
-VAE_PARALLEL=true \
-MAX_CONCURRENT_TASKS=1 \
-TASK_TIMEOUT=3600 \
-SERVER_PORT=8089 \
-./start_service.sh
+# T5 CPU 模式 (节省显存)
+T5_CPU=true MAX_CONCURRENT_TASKS=2 ./scripts/start_service_npu.sh
+
+# 高性能模式
+T5_CPU=false MAX_CONCURRENT_TASKS=4 ./scripts/start_service_cuda.sh
+
+# 调试模式
+MAX_CONCURRENT_TASKS=1 TASK_TIMEOUT=3600 ./scripts/start_service_general.sh
 ```
 
-**4. 传统启动方式**
+### 6. 服务验证
+
 ```bash
-# 手动启动（不推荐，除非需要特殊配置）
-mkdir -p generated_videos
-torchrun --nproc_per_node=8 src/i2v_api.py
+# 健康检查
+curl http://localhost:8088/health
+
+# 设备信息
+curl http://localhost:8088/device-info
+
+# API 文档
+open http://localhost:8088/docs
 ```
 
-#### 🧠 T5 CPU 模式详解
+## 🔍 调试工具
 
-T5 CPU 模式是为了应对 NPU 显存不足而设计的优化方案：
+### 设备检测调试
+```bash
+# 检测可用设备
+python3 scripts/debug/debug_device.py
 
-**优势：**
-- 💾 **节省显存**：T5 文本编码器在 CPU 运行，可节省约 6-8GB NPU 显存
-- 🔧 **兼容性强**：适用于各种 NPU 型号，特别是 24GB 显存的设备
-- 🛡️ **稳定性高**：减少显存压力，降低 OOM 错误概率
+# 设备详细信息
+python3 scripts/debug/debug_device.py --verbose
+```
 
-**劣势：**
-- ⏱️ **速度稍慢**：T5 编码增加 3-6 秒，总体生成时间延长约 20%
-- 🔄 **数据传输**：CPU-NPU 间需要传输编码结果
-- 💻 **内存需求**：需要更多系统内存（建议 32GB+）
+### T5 预热调试
+```bash
+# T5 CPU 模式预热测试
+python3 scripts/debug/debug_t5_warmup.py --warmup-steps 3
 
-**性能对比：**
+# 指定模型路径测试
+python3 scripts/debug/debug_t5_warmup.py --model-path /path/to/model
+```
 
-| 模式 | T5 位置 | 显存占用 | 生成时间 | 并发任务 | 适用场景 |
-|------|---------|----------|----------|----------|----------|
-| 标准模式 | NPU | ~28GB | 2-3分钟 | 3-5 | 大显存 NPU |
-| T5 CPU | CPU | ~20GB | 2.5-3.5分钟 | 2-3 | 小显存 NPU |
+### 内存监控调试
+```bash
+# 查看当前内存状态
+python3 scripts/debug/debug_memory.py --mode status
 
-服务启动后：
-- **API 服务**：http://localhost:8088
-- **API 文档**：http://localhost:8088/docs
-- **健康检查**：http://localhost:8088/health
-- **监控指标**：http://localhost:8088/metrics
+# 连续监控 60 秒
+python3 scripts/debug/debug_memory.py --mode monitor --duration 60
+
+# 模型加载内存测试
+python3 scripts/debug/debug_memory.py --mode model-test
+
+# 内存压力测试
+python3 scripts/debug/debug_memory.py --mode stress-test
+```
+
+### 管道调试
+```bash
+# 测试管道创建
+python3 scripts/debug/debug_pipeline.py
+
+# 批量调试测试
+bash scripts/debug/run_debug.sh
+```
+
+## 📊 监控和维护
+
+### 健康监控工具
+```bash
+# 实时健康监控
+python3 tools/health_monitor.py --url http://localhost:8088 --interval 30
+
+# 连续监控 1 小时
+python3 tools/health_monitor.py --duration 3600 --export health_report.json
+
+# 告警监控
+python3 tools/health_monitor.py --alert-on-error --alert-on-high-memory
+```
+
+### 性能基准测试
+```bash
+# 基础性能测试
+python3 tools/benchmark.py --requests 10 --concurrent 2
+
+# 压力测试
+python3 tools/benchmark.py --requests 50 --concurrent 5 --duration 1800
+
+# 导出测试报告
+python3 tools/benchmark.py --export benchmark_report.json
+```
+
+### 配置管理
+```bash
+# 生成不同环境配置
+python3 tools/config_generator.py --preset development --output configs/dev.env
+python3 tools/config_generator.py --preset production --output configs/prod.env
+python3 tools/config_generator.py --preset high_quality --output configs/hq.env
+
+# 列出所有预设
+python3 tools/config_generator.py --list-presets
+```
 
 ## 📚 API 接口文档
 
-### 接口概览
+### 核心接口
 
-| 端点 | 方法 | 功能 | 状态码 |
-|------|------|------|--------|
-| `/video/submit` | POST | 提交视频生成任务 | 202 |
-| `/video/status` | POST | 查询任务状态 | 200 |
-| `/video/cancel` | POST | 取消任务 | 200 |
-| `/health` | GET | 服务健康检查 | 200 |
-| `/metrics` | GET | 获取详细指标 | 200 |
-| `/docs` | GET | API 文档 | 200 |
+| 端点 | 方法 | 功能 | 说明 |
+|------|------|------|------|
+| `/video/submit` | POST | 提交视频生成任务 | 支持分层参数配置 |
+| `/video/status` | POST | 查询任务状态 | 实时进度跟踪 |
+| `/video/cancel` | POST | 取消任务 | 支持优雅取消 |
+| `/health` | GET | 服务健康检查 | 完整系统状态 |
+| `/metrics` | GET | 监控指标 | 性能统计数据 |
+| `/device-info` | GET | 设备信息 | 硬件配置详情 |
+| `/docs` | GET | API 文档 | 交互式文档 |
 
-### 1. 🎬 提交视频生成任务
+### 请求参数分层
 
-**POST** `/video/submit`
-
-#### 请求参数
-
+#### 基础参数 (普通用户)
 ```json
 {
-  "prompt": "A white cat wearing sunglasses sits on a surfboard at the beach",
+  "prompt": "A cat playing in the garden",
   "image_url": "https://example.com/input.jpg",
-  "image_size": "1280*720",
-  "num_frames": 81,
-  "guidance_scale": 3.0,
-  "infer_steps": 30,
-  "seed": 42,
-  "negative_prompt": "blurry, low quality",
-  
-  // 分布式配置
-  "vae_parallel": true,
-  "ulysses_size": 8,
-  "dit_fsdp": true,
+  "quality_preset": "balanced"
+}
+```
+
+#### 进阶参数 (高级用户)
+```json
+{
+  "prompt": "A cat playing in the garden",
+  "image_url": "https://example.com/input.jpg", 
+  "quality_preset": "custom",
+  "guidance_scale": 4.0,
+  "infer_steps": 40,
+  "sample_solver": "dpmpp"
+}
+```
+
+#### 专家参数 (系统管理员)
+```json
+{
+  "prompt": "A cat playing in the garden",
+  "image_url": "https://example.com/input.jpg",
   "t5_fsdp": true,
-  
-  // 性能优化
   "use_attentioncache": true,
-  "start_step": 12,
-  "attentioncache_interval": 4,
-  "end_step": 37,
-  "sample_solver": "unipc"
+  "cache_start_step": 12
 }
 ```
 
-#### 响应
+### 响应示例
 
-```json
-{
-  "requestId": "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6"
-}
-```
-
-#### 错误响应
-
-```json
-{
-  "error": "VALIDATION_ERROR",
-  "message": "参数验证失败的具体信息"
-}
-```
-
-```json
-{
-  "detail": "服务器繁忙，请稍后重试"  // 429 状态码
-}
-```
-
-### 2. 📊 查询任务状态
-
-**POST** `/video/status`
-
-#### 请求参数
-
-```json
-{
-  "requestId": "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6"
-}
-```
-
-#### 响应
-
-```json
-{
-  "status": "Succeed",
-  "reason": null,
-  "results": {
-    "video_url": "/videos/a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6.mp4",
-    "video_path": "generated_videos/a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6.mp4"
-  },
-  "queue_position": null,
-  "progress": 1.0,
-  "created_at": 1703847600.123,
-  "updated_at": 1703847720.456
-}
-```
-
-#### 任务状态说明
-
-| 状态 | 描述 |
-|------|------|
-| `InQueue` | 任务已提交，等待处理 |
-| `InProgress` | 正在生成视频 |
-| `Succeed` | 生成成功 |
-| `Failed` | 生成失败 |
-| `Cancelled` | 任务已取消 |
-
-### 3. ❌ 取消任务
-
-**POST** `/video/cancel`
-
-#### 请求参数
-
-```json
-{
-  "requestId": "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6"
-}
-```
-
-#### 响应
-
-```json
-{
-  "status": "Cancelled"
-}
-```
-
-### 4. 🏥 健康检查
-
-**GET** `/health`
-
-#### 响应
-
+#### 健康检查响应
 ```json
 {
   "status": "healthy",
   "timestamp": 1703847600.123,
   "uptime": 3600.5,
-  "rank": 0,
-  "world_size": 8,
   "config": {
-    "t5_cpu": false,
-    "dit_fsdp": true,
-    "vae_parallel": true,
-    "max_concurrent": 5,
-    "task_timeout": 1800
+    "device_type": "npu",
+    "device_count": 8,
+    "t5_cpu": true,
+    "max_concurrent": 2
   },
   "service": {
     "total_tasks": 15,
-    "pipeline_world_size": 8,
-    "pipeline_rank": 0
+    "active_tasks": 1,
+    "success_rate": 95.5
   },
   "resources": {
-    "concurrent_tasks": 2,
-    "max_concurrent": 5,
-    "available_slots": 3
+    "memory_usage": "68.5%",
+    "available_slots": 1
   }
 }
 ```
 
-### 5. 📈 监控指标
+## ⚡ 性能优化
 
-**GET** `/metrics`
+### T5 CPU 模式对比
 
-#### 响应
+| 模式 | T5 位置 | 显存占用 | 生成时间 | 并发能力 | 适用场景 |
+|------|---------|----------|----------|----------|----------|
+| 标准模式 | NPU/GPU | ~28GB | 2-3分钟 | 4-5任务 | 大显存环境 |
+| T5 CPU | CPU | ~20GB | 2.5-3.5分钟 | 2-3任务 | 显存受限环境 |
+| 混合模式 | 自适应 | ~24GB | 2.2-3分钟 | 3-4任务 | 平衡性能 |
 
-```json
-{
-  "timestamp": 1703847600.123,
-  "service": {
-    "total_tasks": 15,
-    "pipeline_world_size": 8,
-    "pipeline_rank": 0
-  },
-  "resources": {
-    "concurrent_tasks": 2,
-    "max_concurrent": 5,
-    "available_slots": 3
-  },
-  "config": {
-    "model": {
-      "t5_cpu": false,
-      "dit_fsdp": true,
-      "vae_parallel": true,
-      "ulysses_size": 8
-    },
-    "business": {
-      "max_concurrent_tasks": 5,
-      "task_timeout": 1800
-    }
-  },
-  "system": {
-    "rank": 0,
-    "world_size": 8,
-    "uptime": 3600.5
-  }
-}
+### 设备特性对比
+
+| 平台 | 优势 | 劣势 | 推荐配置 |
+|------|------|------|----------|
+| **NPU (昇腾)** | 高能效、大显存 | 生态相对较新 | T5_CPU=true, 保守并发 |
+| **GPU (NVIDIA)** | 成熟生态、高性能 | 功耗较高 | T5_CPU=false, 激进并发 |
+
+### 性能调优建议
+
+#### 内存优化
+```bash
+# 显存受限环境
+T5_CPU=true
+DIT_FSDP=true
+VAE_PARALLEL=false
+MAX_CONCURRENT_TASKS=2
+```
+
+#### 速度优化  
+```bash
+# 追求最高性能
+T5_CPU=false
+VAE_PARALLEL=true
+USE_ATTENTION_CACHE=true
+ULYSSES_SIZE=8
+```
+
+#### 平衡配置
+```bash
+# 性能与稳定性平衡
+T5_CPU=true
+DIT_FSDP=true
+VAE_PARALLEL=true
+MAX_CONCURRENT_TASKS=3
 ```
 
 ## 🎛️ 配置参数
@@ -508,7 +436,42 @@ T5 CPU 模式是为了应对 NPU 显存不足而设计的优化方案：
 | `HCCL_CONNECT_TIMEOUT` | 600 | 900 | HCCL 连接超时(秒) |
 | `HCCL_BUFFSIZE` | 512 | 256 | HCCL 缓冲区大小 |
 
-### 基础参数
+#### NPU 专用环境变量
+
+| 变量名 | 默认值 | 说明 |
+|--------|--------|------|
+| `ALGO` | 0 | NPU 算法选择 |
+| `PYTORCH_NPU_ALLOC_CONF` | expandable_segments:True | NPU 内存分配策略 |
+| `TASK_QUEUE_ENABLE` | 2 | NPU 任务队列启用级别 |
+| `CPU_AFFINITY_CONF` | 1 | CPU 亲和性配置 |
+| `ASCEND_LAUNCH_BLOCKING` | 0 | NPU 启动阻塞模式 |
+| `ASCEND_GLOBAL_LOG_LEVEL` | 1 | NPU 全局日志级别 |
+| `NPU_VISIBLE_DEVICES` | 0,1,2,3,4,5,6,7 | 可见 NPU 设备 |
+| `ASCEND_RT_VISIBLE_DEVICES` | 0,1,2,3,4,5,6,7 | NPU 运行时可见设备 |
+
+#### CUDA 专用环境变量
+
+| 变量名 | 默认值 | 说明 |
+|--------|--------|------|
+| `NCCL_TIMEOUT` | 3600 | NCCL 通信超时(秒) |
+| `CUDA_LAUNCH_BLOCKING` | 0 | CUDA 启动阻塞模式 |
+| `NCCL_DEBUG` | INFO | NCCL 调试级别 |
+| `NCCL_IB_DISABLE` | 1 | 禁用 InfiniBand |
+| `NCCL_P2P_DISABLE` | 0 | 禁用点对点通信 |
+| `CUDA_VISIBLE_DEVICES` | 0,1,2,3,4,5,6,7 | 可见 CUDA 设备 |
+
+#### CPU 优化配置
+
+| 变量名 | 默认值 | T5 CPU 模式建议 | 说明 |
+|--------|--------|-----------------|------|
+| `OMP_NUM_THREADS` | 8 | 16 | OpenMP 线程数 |
+| `MKL_NUM_THREADS` | 8 | 16 | MKL 线程数 |
+| `OPENBLAS_NUM_THREADS` | 8 | 16 | OpenBLAS 线程数 |
+| `TOKENIZERS_PARALLELISM` | false | false | 分词器并行处理 |
+
+### API 请求参数
+
+#### 基础参数
 
 | 参数 | 类型 | 默认值 | 范围 | 说明 |
 |------|------|--------|------|------|
@@ -521,7 +484,7 @@ T5 CPU 模式是为了应对 NPU 显存不足而设计的优化方案：
 | `seed` | int | null | 0-2147483647 | 随机数种子 |
 | `negative_prompt` | string | null | 0-500字符 | 负面提示词 |
 
-### 分布式参数
+#### 分布式参数
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
@@ -531,7 +494,7 @@ T5 CPU 模式是为了应对 NPU 显存不足而设计的优化方案：
 | `t5_fsdp` | bool | false | T5 编码器 FSDP 分片 |
 | `cfg_size` | int | 1 | CFG 并行组数 |
 
-### 性能优化参数
+#### 性能优化参数
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
@@ -542,40 +505,89 @@ T5 CPU 模式是为了应对 NPU 显存不足而设计的优化方案：
 | `sample_solver` | string | "unipc" | 采样算法 |
 | `sample_shift` | float | 5.0 | 采样偏移 |
 
-## 🚀 使用示例
+### 质量预设配置
 
-### 启动服务示例
+#### 预设模式对比
+
+| 预设模式 | 推理步数 | 引导系数 | 采样算法 | 适用场景 |
+|----------|----------|----------|----------|----------|
+| `fast` | 20 | 2.5 | unipc | 快速测试 |
+| `balanced` | 30 | 3.0 | unipc | 日常使用 |
+| `high` | 50 | 4.0 | dpmpp | 高质量输出 |
+| `custom` | 用户定义 | 用户定义 | 用户定义 | 自定义配置 |
+
+#### 支持的分辨率
+
+| 分辨率 | 比例 | 显存需求 | 生成时间 | 推荐场景 |
+|--------|------|----------|----------|----------|
+| `1280*720` | 16:9 | 标准 | 标准 | 横屏视频 |
+| `720*1280` | 9:16 | 标准 | 标准 | 竖屏视频 |
+| `1024*576` | 16:9 | 较低 | 较快 | 快速预览 |
+| `1920*1080` | 16:9 | 较高 | 较慢 | 高清输出 |
+
+#### 支持的帧数
+
+| 帧数 | 时长 (24fps) | 显存需求 | 生成时间 | 推荐场景 |
+|------|--------------|----------|----------|----------|
+| 41 | ~1.7秒 | 较低 | 较快 | 短视频片段 |
+| 61 | ~2.5秒 | 标准 | 标准 | 常规视频 |
+| 81 | ~3.4秒 | 标准 | 标准 | 默认长度 |
+| 121 | ~5.0秒 | 较高 | 较慢 | 长视频 |
+
+### 配置模板示例
+
+#### 开发环境配置
 
 ```bash
-# 1. 标准模式（推荐用于大显存 NPU）
-T5_CPU=false ./start_service.sh
-
-# 2. T5 CPU 模式（推荐用于小显存 NPU）
-T5_CPU=true ./start_service.sh
-
-# 3. 高性能配置（大显存 NPU）
-T5_CPU=false \
-DIT_FSDP=true \
-VAE_PARALLEL=true \
-MAX_CONCURRENT_TASKS=5 \
-ULYSSES_SIZE=8 \
-./start_service.sh
-
-# 4. 内存优化配置（小显存 NPU）
-T5_CPU=true \
-DIT_FSDP=true \
-VAE_PARALLEL=false \
-MAX_CONCURRENT_TASKS=2 \
-ULYSSES_SIZE=4 \
-./start_service.sh
-
-# 5. 调试模式
-T5_CPU=true \
-MAX_CONCURRENT_TASKS=1 \
-TASK_TIMEOUT=3600 \
-ASCEND_GLOBAL_LOG_LEVEL=0 \
-./start_service.sh
+# 开发测试环境
+export T5_CPU=true
+export MAX_CONCURRENT_TASKS=1
+export TASK_TIMEOUT=3600
+export DIT_FSDP=false
+export VAE_PARALLEL=false
+export ULYSSES_SIZE=1
+export ASCEND_GLOBAL_LOG_LEVEL=0  # 详细日志
 ```
+
+#### 生产环境配置
+
+```bash
+# 生产环境 - NPU 高性能
+export T5_CPU=false
+export MAX_CONCURRENT_TASKS=5
+export TASK_TIMEOUT=1800
+export DIT_FSDP=true
+export VAE_PARALLEL=true
+export ULYSSES_SIZE=8
+export USE_ATTENTION_CACHE=true
+```
+
+#### 内存优化配置
+
+```bash
+# 内存受限环境
+export T5_CPU=true
+export MAX_CONCURRENT_TASKS=2
+export TASK_TIMEOUT=2400
+export DIT_FSDP=true
+export VAE_PARALLEL=false
+export ULYSSES_SIZE=4
+export HCCL_TIMEOUT=3600
+```
+
+#### 调试配置
+
+```bash
+# 调试模式
+export T5_CPU=true
+export MAX_CONCURRENT_TASKS=1
+export TASK_TIMEOUT=7200
+export ASCEND_GLOBAL_LOG_LEVEL=0
+export ASCEND_LAUNCH_BLOCKING=1
+export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
+```
+
+## 🚀 使用示例
 
 ### API 调用示例
 
@@ -598,7 +610,7 @@ curl -X POST "http://localhost:8088/video/status" \
 -H "Content-Type: application/json" \
 -d '{"requestId": "your-task-id-here"}'
 
-# 检查服务健康状态（会显示 T5 CPU 模式状态）
+# 检查服务健康状态
 curl "http://localhost:8088/health"
 
 # 获取监控指标
@@ -679,286 +691,192 @@ except requests.RequestException as e:
     print(f"网络错误: {str(e)}")
 ```
 
-## 🏗️ 架构设计
-
-### 分布式架构
-
-```
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   Rank 0 (主)   │    │   Rank 1-7      │    │   客户端请求     │
-│  FastAPI 服务   │◄───┤   分布式推理     │◄───┤   HTTP API      │
-│  任务管理       │    │   模型分片       │    │   WebSocket     │
-│  资源控制       │    │                 │    │                 │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
-         │                        │
-         └────────┬─────────────────┘
-                  ▼
-    ┌─────────────────────────────────┐
-    │       HCCL 通信后端             │
-    │   (华为昇腾分布式通信框架)        │
-    └─────────────────────────────────┘
-```
-
-### T5 CPU 模式架构
-
-```
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│  T5 编码器      │    │   DiT/VAE 模型   │    │   分布式通信     │
-│  (CPU 运行)     │────┤   (NPU 分片)     │◄───┤   (HCCL)       │
-│  文本编码       │    │   视频生成       │    │   模型同步       │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
-         │                        │
-         └───── CPU-NPU 数据传输 ────┘
-```
-
-### 数据流
-
-```
-HTTP 请求 → API 层 → 服务层 → 管道层 → 分布式模型 → 视频生成 → 文件保存 → HTTP 响应
-   ↓           ↓        ↓        ↓          ↓          ↓          ↓          ↓
-i2v_api.py → video_service.py → multigpu_pipeline.py → WanI2V → cache_video → 静态文件服务
-   ↓
-资源管理 → 并发控制 → 异常处理 → 监控记录
-```
-
-## ⚡ 性能特性
-
-### 多卡并行加速
-
-- **模型分片**：T5/DiT 模型 FSDP 分片，减少单卡内存占用
-- **序列并行**：Ulysses 序列并行，处理长视频序列
-- **VAE 并行**：视频编解码并行处理
-- **CFG 并行**：分类器自由引导并行计算
-
-### T5 CPU 优化
-
-- **内存节省**：T5 在 CPU 运行，节省 6-8GB NPU 显存
-- **智能调度**：自动调整超时时间和并发数
-- **缓存预热**：启动时预热 T5 编码器，减少首次延迟
-- **异步传输**：优化 CPU-NPU 数据传输效率
-
-### 推理优化
-
-- **注意力缓存**：缓存中间注意力结果，减少重复计算
-- **混合精度**：自动混合精度训练，提升计算效率
-- **异步处理**：异步 I/O 和任务队列，提升并发能力
-
-### 资源管理
-
-- **并发控制**：限制同时处理的任务数量，防止资源耗尽
-- **内存管理**：自动清理过期任务和临时文件
-- **负载均衡**：智能任务调度，充分利用硬件资源
-
-### 预期性能
-
-| 配置 | T5 位置 | 分辨率 | 帧数 | 生成时间 | 显存占用 | 并发数 |
-|------|---------|--------|------|----------|----------|--------|
-| 8卡 NPU | NPU | 1280×720 | 81帧 | ~2-3分钟 | ~28GB | 3-5 |
-| 8卡 NPU | CPU | 1280×720 | 81帧 | ~2.5-3.5分钟 | ~20GB | 2-3 |
-| 8卡 NPU | NPU | 1280×720 | 121帧 | ~3-4分钟 | ~35GB | 1-3 |
-| 8卡 NPU | CPU | 1280×720 | 121帧 | ~3.5-4.5分钟 | ~25GB | 1-2 |
-
 ## 🛠️ 故障排除
 
-### 常见问题
+### 常见问题及解决方案
 
-#### 1. 服务启动失败
-
+#### 1. 启动失败
 ```bash
-# 症状：ImportError 或模块不存在
-# 解决方案：
-export PYTHONPATH=/path/to/your/project:$PYTHONPATH
+# 检查环境
+python3 tools/verify_structure.py
+
+# 检查设备
+python3 scripts/debug/debug_device.py
+
+# 检查依赖
 pip install -r requirements.txt
-
-# 症状：端口被占用
-# 解决方案：
-export SERVER_PORT=8089  # 使用其他端口
 ```
 
-#### 2. HCCL 初始化失败
-
+#### 2. 内存不足
 ```bash
-# 症状：RuntimeError: HCCL init failed
-# 解决方案：
-ps aux | grep python | grep i2v_api | awk '{print $2}' | xargs kill -9
-sleep 10
-T5_CPU=true ./start_service.sh  # 使用 T5 CPU 模式降低资源需求
+# 使用 T5 CPU 模式
+T5_CPU=true MAX_CONCURRENT_TASKS=1 ./scripts/start_service_npu.sh
+
+# 内存监控
+python3 scripts/debug/debug_memory.py --mode monitor
 ```
 
-#### 3. 任务提交被拒绝
-
+#### 3. T5 预热失败
 ```bash
-# 症状：HTTP 429 "服务器繁忙"
-# 原因：并发任务数超过限制
-# 解决方案：
-export MAX_CONCURRENT_TASKS=10  # 增加并发限制
-# 或等待当前任务完成
+# T5 预热调试
+python3 scripts/debug/debug_t5_warmup.py --warmup-steps 1
+
+# 增加系统内存
+echo "vm.swappiness=10" >> /etc/sysctl.conf
 ```
 
-#### 4. NPU 内存不足
-
+#### 4. 设备通信错误
 ```bash
-# 检查 NPU 状态
-npu-smi info
-# 清理 NPU 缓存
-python -c "import torch_npu; torch_npu.npu.empty_cache()"
-# 使用 T5 CPU 模式节省显存
-T5_CPU=true MAX_CONCURRENT_TASKS=2 ./start_service.sh
+# NPU 环境重置
+export HCCL_TIMEOUT=7200
+pkill -f i2v_api && sleep 10
+
+# GPU 环境重置  
+export NCCL_TIMEOUT=7200
+nvidia-smi --gpu-reset
 ```
 
-#### 5. T5 CPU 模式特定问题
+### 调试流程
 
 ```bash
-# 症状：T5 编码速度过慢
-# 解决方案：确保有足够的 CPU 核心和内存
-export OMP_NUM_THREADS=16  # 增加 CPU 线程数
+# 1. 验证项目结构
+python3 tools/verify_structure.py
 
-# 症状：CPU-NPU 数据传输超时
-# 解决方案：延长超时时间
-export HCCL_TIMEOUT=3600  # 1小时超时
-```
+# 2. 检测硬件环境
+python3 scripts/debug/debug_device.py
 
-#### 6. 任务失败常见原因
+# 3. 测试 T5 预热
+python3 scripts/debug/debug_t5_warmup.py
 
-- **图像下载失败**：检查 `image_url` 是否可访问
-- **参数验证失败**：检查帧数、分辨率等参数范围
-- **模型文件缺失**：确认 `MODEL_CKPT_DIR` 路径正确
-- **T5 CPU 内存不足**：增加系统内存或减少并发数
+# 4. 监控内存使用
+python3 scripts/debug/debug_memory.py --mode status
 
-### 日志调试
+# 5. 启动服务
+./scripts/start_service_general.sh
 
-```bash
-# 启用详细日志
-export PYTHONPATH=/path/to/your/project
-export ASCEND_GLOBAL_LOG_LEVEL=0  # 详细日志
-T5_CPU=true ./start_service.sh
-
-# 查看实时日志
-tail -f /var/log/video_generation.log
-
-# 查看错误日志
-grep ERROR /var/log/video_generation.log
-
-# 查看 T5 CPU 相关日志
-grep "T5 CPU" /var/log/video_generation.log
-```
-
-## 📊 监控和维护
-
-### 健康检查
-
-```bash
-# 基础健康检查
+# 6. 健康检查
 curl http://localhost:8088/health
+```
 
-# 详细监控指标
-curl http://localhost:8088/metrics
+## 🔒 生产部署
 
-# 响应示例（T5 CPU 模式）
-{
-  "status": "healthy",
-  "timestamp": 1703847600.123,
-  "uptime": 3600.5,
-  "rank": 0,
-  "world_size": 8,
-  "config": {
-    "t5_cpu": true,
-    "dit_fsdp": true,
-    "vae_parallel": true,
-    "max_concurrent": 2,
-    "task_timeout": 2400
-  },
-  "service": {
-    "total_tasks": 15,
-    "pipeline_world_size": 8,
-    "pipeline_rank": 0
-  },
-  "resources": {
-    "concurrent_tasks": 1,
-    "max_concurrent": 2,
-    "available_slots": 1
-  }
+### 安全配置
+
+```bash
+# 访问控制
+export ALLOWED_HOSTS="api.company.com,*.company.com"
+
+# 资源限制
+export MAX_CONCURRENT_TASKS=3
+export TASK_TIMEOUT=1800
+export MAX_OUTPUT_DIR_SIZE=100
+
+# 文件权限
+chmod 750 generated_videos/
+chown www-data:www-data generated_videos/
+```
+
+### 反向代理 (Nginx)
+
+```nginx
+upstream i2v_backend {
+    server 127.0.0.1:8088;
+}
+
+server {
+    listen 80;
+    server_name api.company.com;
+    
+    client_max_body_size 100M;
+    
+    location / {
+        proxy_pass http://i2v_backend;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_read_timeout 1800s;
+    }
+    
+    location /videos/ {
+        alias /path/to/generated_videos/;
+        expires 1d;
+    }
 }
 ```
 
-### 自动清理
+### 系统服务 (systemd)
 
-服务会自动执行以下清理任务：
+```ini
+[Unit]
+Description=FastAPI Multi-GPU I2V Service
+After=network.target
 
-- **过期任务清理**：每5分钟清理超时的已完成任务
-- **视频文件清理**：当存储超过限制时自动删除最旧的文件
-- **资源释放**：任务完成后自动释放并发槽位
-- **NPU 缓存清理**：异常时自动清理 NPU 内存
+[Service]
+Type=simple
+User=i2v-service
+WorkingDirectory=/opt/fastapi-multigpu-i2v
+Environment=T5_CPU=true
+Environment=MAX_CONCURRENT_TASKS=2
+ExecStart=/opt/fastapi-multigpu-i2v/scripts/start_service_npu.sh
+Restart=always
+RestartSec=10
 
-### 手动维护
-
-```bash
-# 重启服务
-ps aux | grep i2v_api | awk '{print $2}' | xargs kill -15
-sleep 5
-T5_CPU=true ./start_service.sh
-
-# 清理生成的视频文件
-find generated_videos -type f -mtime +7 -delete
-
-# 检查磁盘使用
-du -sh generated_videos/
-
-# 检查 T5 CPU 模式内存使用
-free -h
-top -p $(pgrep -f i2v_api)
+[Install]
+WantedBy=multi-user.target
 ```
-
-## 🔒 安全注意事项
-
-### 生产环境配置
-
-```bash
-# 限制允许的主机
-export ALLOWED_HOSTS="api.example.com,*.example.com"
-
-# T5 CPU 模式的资源限制
-export MAX_CONCURRENT_TASKS=2
-export TASK_TIMEOUT=1800  # 30分钟超时
-
-# 设置安全的文件权限
-chmod 750 generated_videos/
-```
-
-### 安全检查清单
-
-- ✅ **输入验证**：严格验证图像 URL 和提示词
-- ✅ **资源限制**：限制并发任务数量和视频长度
-- ✅ **访问控制**：配置允许的主机列表
-- ✅ **文件清理**：定期清理生成的视频文件
-- ✅ **错误处理**：不暴露内部错误信息
-- ✅ **内存监控**：T5 CPU 模式下的系统内存监控
-- ⚠️ **认证机制**：生产环境建议添加 API Key 或 OAuth
-- ⚠️ **HTTPS**：生产环境使用 HTTPS 加密传输
-- ⚠️ **防火墙**：限制服务端口的网络访问
 
 ## 📋 依赖清单
 
+### 核心依赖
 ```txt
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
 pydantic>=2.5.0
 aiohttp>=3.9.0
 torch>=2.0.0
-torch_npu
 transformers>=4.30.0
 diffusers>=0.20.0
 numpy>=1.24.0
 Pillow>=10.0.0
 ```
 
+### 设备特定
+```txt
+# NPU 环境
+torch_npu
+
+# GPU 环境  
+torch[cuda]
+
+# 可选依赖
+psutil>=5.9.0        # 系统监控
+opencv-python>=4.8.0 # 视频处理
+```
+
 ## 🤝 贡献指南
 
-1. Fork 项目
-2. 创建功能分支 (`git checkout -b feature/AmazingFeature`)
-3. 提交更改 (`git commit -m 'Add some AmazingFeature'`)
-4. 推送到分支 (`git push origin feature/AmazingFeature`)
-5. 打开 Pull Request
+### 开发流程
+
+1. **Fork 项目**
+2. **创建功能分支**: `git checkout -b feature/amazing-feature`
+3. **验证代码**: `python3 tools/verify_structure.py`
+4. **运行测试**: `python3 -m pytest tests/`
+5. **提交代码**: `git commit -m 'Add amazing feature'`
+6. **推送分支**: `git push origin feature/amazing-feature`
+7. **创建 PR**
+
+### 代码规范
+
+```bash
+# 代码格式化
+black src/ tools/ scripts/
+isort src/ tools/ scripts/
+
+# 类型检查
+mypy src/
+
+# 测试覆盖
+pytest --cov=src tests/
+```
 
 ## 📄 许可证
 
@@ -966,26 +884,39 @@ Pillow>=10.0.0
 
 ## 🙏 致谢
 
-- **Wan AI Team** - 提供基础模型 Wan2.1-I2V-14B-720P
-- **华为昇腾** - NPU 硬件和软件栈支持
-- **FastAPI** - 高性能 Web 框架
+- **Wan AI Team** - 提供 Wan2.1-I2V-14B-720P 模型
+- **华为昇腾** - NPU 硬件和 CANN 软件栈
+- **NVIDIA** - GPU 硬件和 CUDA 软件栈  
+- **FastAPI** - 高性能异步 Web 框架
+- **PyTorch** - 深度学习框架
 
 ---
 
-**📞 技术支持**：如有问题，请提交 [Issue](https://github.com/BruceXcluding/Wan2.1/issues) 或联系维护团队。
+## 📞 技术支持
 
-**🎯 快速开始**：
+- **问题反馈**: [GitHub Issues](https://github.com/your-repo/issues)
+- **讨论交流**: [GitHub Discussions](https://github.com/your-repo/discussions)
+- **技术文档**: [项目 Wiki](https://github.com/your-repo/wiki)
+
+## 🎯 快速验证
+
 ```bash
-# 克隆项目
+# 一键验证和启动
 git clone <repository-url>
 cd fastapi-multigpu-i2v
 
-# 安装依赖
-pip install -r requirements.txt
+# 验证环境
+python3 tools/verify_structure.py
+python3 scripts/debug/debug_device.py
 
-# 启动服务（T5 CPU 模式，适合小显存）
-T5_CPU=true ./start_service.sh
+# 启动服务 (自动检测最佳配置)
+./scripts/start_service_general.sh
 
 # 测试 API
 curl http://localhost:8088/health
+curl -X POST http://localhost:8088/video/submit \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "test video", "image_url": "https://picsum.photos/1280/720"}'
 ```
+
+**🚀 开始你的 AI 视频生成之旅！**

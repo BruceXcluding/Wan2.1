@@ -8,7 +8,6 @@ from contextlib import asynccontextmanager
 from typing import Dict, Any
 
 # 在导入其他模块之前设置环境变量
-os.environ.setdefault("ASCEND_LAUNCH_BLOCKING", "0")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 from fastapi import FastAPI, HTTPException, status, Request, BackgroundTasks
@@ -18,14 +17,16 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
 
-from schemas import (
+# 修复导入 - 使用新的模块结构
+from schemas.video import (
     VideoSubmitRequest,
     VideoStatusRequest,
     VideoStatusResponse,
     VideoCancelRequest
 )
 from services.video_service import VideoService
-from multigpu_pipeline import MultiGPUVideoPipeline
+from pipelines.pipeline_factory import PipelineFactory
+from utils.device_detector import device_detector
 
 # ==================== 配置和常量 ====================
 
@@ -50,7 +51,15 @@ SERVER_CONFIG = {
     "access_log": True,
 }
 
-# 模型配置 - 通过环境变量控制
+# 获取设备信息（在创建配置之前）
+try:
+    device_info = PipelineFactory.get_available_devices()
+    logger.info(f"Detected device: {device_info}")
+except Exception as e:
+    logger.error(f"Failed to detect device: {str(e)}")
+    device_info = {"device_type": "unknown", "device_count": 0, "backend": "unknown"}
+
+# 模型配置 - 通过环境变量控制，自动适配设备
 MODEL_CONFIG = {
     "ckpt_dir": os.environ.get(
         "MODEL_CKPT_DIR", 
@@ -61,10 +70,10 @@ MODEL_CONFIG = {
     "frame_num": int(os.environ.get("DEFAULT_FRAME_NUM", "81")),
     "sample_steps": int(os.environ.get("DEFAULT_SAMPLE_STEPS", "40")),
     
-    # 分布式配置 - 可通过环境变量控制
+    # 分布式配置 - 自动适配设备
     "dit_fsdp": os.environ.get("DIT_FSDP", "true").lower() == "true",
     "t5_fsdp": os.environ.get("T5_FSDP", "false").lower() == "true",
-    "t5_cpu": os.environ.get("T5_CPU", "false").lower() == "true",  # 关键参数
+    "t5_cpu": os.environ.get("T5_CPU", "false").lower() == "true",
     "cfg_size": int(os.environ.get("CFG_SIZE", "1")),
     "ulysses_size": int(os.environ.get("ULYSSES_SIZE", "8")),
     "vae_parallel": os.environ.get("VAE_PARALLEL", "true").lower() == "true",
@@ -76,11 +85,19 @@ MODEL_CONFIG = {
     "end_step": int(os.environ.get("CACHE_END_STEP", "37")),
 }
 
-# 业务配置 - 根据 T5 CPU 模式调整
+# 业务配置 - 根据设备类型和 T5 CPU 模式调整
 t5_cpu_mode = MODEL_CONFIG["t5_cpu"]
+is_npu = device_info.get("device_type") == "npu"
+
 BUSINESS_CONFIG = {
-    "max_concurrent_tasks": int(os.environ.get("MAX_CONCURRENT_TASKS", "2" if t5_cpu_mode else "5")),
-    "task_timeout": int(os.environ.get("TASK_TIMEOUT", "2400" if t5_cpu_mode else "1800")),  # T5 CPU 需要更长时间
+    "max_concurrent_tasks": int(os.environ.get(
+        "MAX_CONCURRENT_TASKS", 
+        "2" if (t5_cpu_mode or is_npu) else "5"
+    )),
+    "task_timeout": int(os.environ.get(
+        "TASK_TIMEOUT", 
+        "2400" if t5_cpu_mode else "1800"
+    )),
     "cleanup_interval": int(os.environ.get("CLEANUP_INTERVAL", "300")),
     "max_video_output_dir_size": int(os.environ.get("MAX_OUTPUT_DIR_SIZE", "50")),
     "allowed_hosts": os.environ.get("ALLOWED_HOSTS", "*").split(","),
@@ -163,11 +180,13 @@ class ResourceManager:
 # ==================== 初始化 ====================
 
 logger.info(f"Initializing pipeline on rank {LOCAL_RANK}/{WORLD_SIZE}")
+logger.info(f"Device info: {device_info}")
 logger.info(f"Model configuration: {MODEL_CONFIG}")
 logger.info(f"T5 CPU mode: {t5_cpu_mode}")
 
 try:
-    pipeline = MultiGPUVideoPipeline(**MODEL_CONFIG)
+    # 使用工厂模式创建管道，自动适配设备
+    pipeline = PipelineFactory.create_pipeline(**MODEL_CONFIG)
     logger.info("Pipeline initialized successfully")
 except Exception as e:
     logger.error(f"Failed to initialize pipeline: {str(e)}")
@@ -175,48 +194,14 @@ except Exception as e:
         sys.exit(1)
     raise
 
-# ==================== FastAPI 应用 ====================
+# ==================== FastAPI 应用（仅在主进程） ====================
 
 if LOCAL_RANK == 0:
-    # 主进程启动 HTTP 服务
     
     # 初始化服务组件
     video_service = VideoService(pipeline)
     resource_manager = ResourceManager()
     
-    @asynccontextmanager
-    async def lifespan(app: FastAPI):
-        """应用生命周期管理"""
-        logger.info("FastAPI application starting up")
-        
-        # 创建视频输出目录
-        os.makedirs("generated_videos", exist_ok=True)
-        
-        # 启动后台任务
-        cleanup_task = asyncio.create_task(periodic_cleanup())
-        monitor_task = asyncio.create_task(resource_monitor())
-        
-        # 设置应用状态
-        app.state.video_service = video_service
-        app.state.resource_manager = resource_manager
-        app.state.start_time = time.time()
-        app.state.pipeline = pipeline
-        
-        yield
-        
-        # 清理资源
-        logger.info("Shutting down FastAPI application...")
-        cleanup_task.cancel()
-        monitor_task.cancel()
-        
-        try:
-            await asyncio.gather(cleanup_task, monitor_task, return_exceptions=True)
-        except Exception as e:
-            logger.error(f"Error during cleanup: {str(e)}")
-        
-        pipeline.cleanup()
-        logger.info("FastAPI application shut down completed")
-
     async def periodic_cleanup():
         """定期清理任务"""
         while True:
@@ -289,11 +274,44 @@ if LOCAL_RANK == 0:
             except Exception as e:
                 logger.error(f"Resource monitor error: {str(e)}")
 
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        """应用生命周期管理"""
+        logger.info("FastAPI application starting up")
+        
+        # 创建视频输出目录
+        os.makedirs("generated_videos", exist_ok=True)
+        
+        # 启动后台任务
+        cleanup_task = asyncio.create_task(periodic_cleanup())
+        monitor_task = asyncio.create_task(resource_monitor())
+        
+        # 设置应用状态
+        app.state.video_service = video_service
+        app.state.resource_manager = resource_manager
+        app.state.start_time = time.time()
+        app.state.pipeline = pipeline
+        
+        yield
+        
+        # 清理资源
+        logger.info("Shutting down FastAPI application...")
+        cleanup_task.cancel()
+        monitor_task.cancel()
+        
+        try:
+            await asyncio.gather(cleanup_task, monitor_task, return_exceptions=True)
+        except Exception as e:
+            logger.error(f"Error during cleanup: {str(e)}")
+        
+        pipeline.cleanup()
+        logger.info("FastAPI application shut down completed")
+
     # 创建 FastAPI 应用
     app = FastAPI(
         title="Multi-GPU Video Generation API",
-        description=f"基于 Wan2.1-I2V-14B-720P 的多卡分布式视频生成服务 (T5 CPU: {t5_cpu_mode})",
-        version="2.0.0",
+        description=f"基于 Wan2.1-I2V-14B-720P 的多设备分布式视频生成服务 (Device: {device_info.get('device_type', 'unknown').upper()}, T5 CPU: {t5_cpu_mode})",
+        version="3.0.0",
         lifespan=lifespan,
         docs_url="/docs",
         redoc_url="/redoc",
@@ -343,6 +361,28 @@ if LOCAL_RANK == 0:
 
     # ==================== API 路由 ====================
 
+    async def release_task_slot_after_completion(task_id: str, resource_manager: ResourceManager):
+        """任务完成后释放资源槽位"""
+        try:
+            max_wait_time = BUSINESS_CONFIG["task_timeout"]
+            start_time = time.time()
+            
+            while True:
+                if time.time() - start_time > max_wait_time:
+                    logger.warning(f"Task {task_id} monitoring timeout after {max_wait_time}s")
+                    break
+                
+                task = await video_service.get_task_status(task_id)
+                if not task or task["status"] in ["Succeed", "Failed", "Cancelled"]:
+                    break
+                await asyncio.sleep(5)
+            
+            await resource_manager.release_task_slot(task_id)
+            logger.info(f"Released resource slot for task {task_id}")
+            
+        except Exception as e:
+            logger.error(f"Error releasing resource slot for task {task_id}: {str(e)}")
+
     @app.post("/video/submit", response_model=dict, status_code=status.HTTP_202_ACCEPTED)
     async def submit_video_task(request: VideoSubmitRequest, background_tasks: BackgroundTasks):
         """提交视频生成任务"""
@@ -379,28 +419,6 @@ if LOCAL_RANK == 0:
             logger.error(f"Failed to submit task: {str(e)}")
             raise VideoGenerationException("任务提交失败，请检查参数或稍后重试", "TASK_SUBMIT_ERROR")
 
-    async def release_task_slot_after_completion(task_id: str, resource_manager: ResourceManager):
-        """任务完成后释放资源槽位"""
-        try:
-            max_wait_time = BUSINESS_CONFIG["task_timeout"]
-            start_time = time.time()
-            
-            while True:
-                if time.time() - start_time > max_wait_time:
-                    logger.warning(f"Task {task_id} monitoring timeout after {max_wait_time}s")
-                    break
-                
-                task = await video_service.get_task_status(task_id)
-                if not task or task["status"] in ["Succeed", "Failed", "Cancelled"]:
-                    break
-                await asyncio.sleep(5)
-            
-            await resource_manager.release_task_slot(task_id)
-            logger.info(f"Released resource slot for task {task_id}")
-            
-        except Exception as e:
-            logger.error(f"Error releasing resource slot for task {task_id}: {str(e)}")
-
     @app.post("/video/status", response_model=VideoStatusResponse)
     async def get_task_status(request: VideoStatusRequest):
         """查询任务状态"""
@@ -422,6 +440,17 @@ if LOCAL_RANK == 0:
         
         return {"status": "Cancelled", "message": "任务已取消"}
 
+    @app.get("/device_info")
+    async def get_device_info():
+        """获取设备信息"""
+        return {
+            "device_info": device_info,
+            "model_config": MODEL_CONFIG,
+            "business_config": BUSINESS_CONFIG,
+            "rank": LOCAL_RANK,
+            "world_size": WORLD_SIZE
+        }
+    
     @app.get("/health")
     async def health_check():
         """健康检查"""
@@ -440,7 +469,8 @@ if LOCAL_RANK == 0:
                     "dit_fsdp": MODEL_CONFIG["dit_fsdp"],
                     "vae_parallel": MODEL_CONFIG["vae_parallel"],
                     "max_concurrent": BUSINESS_CONFIG["max_concurrent_tasks"],
-                    "task_timeout": BUSINESS_CONFIG["task_timeout"]
+                    "task_timeout": BUSINESS_CONFIG["task_timeout"],
+                    "device_type": device_info.get("device_type", "unknown")
                 },
                 "service": service_stats,
                 "resources": resource_stats
@@ -467,7 +497,8 @@ if LOCAL_RANK == 0:
                 "system": {
                     "rank": LOCAL_RANK,
                     "world_size": WORLD_SIZE,
-                    "uptime": time.time() - app.state.start_time
+                    "uptime": time.time() - app.state.start_time,
+                    "device_type": device_info.get("device_type", "unknown")
                 }
             }
         except Exception as e:
@@ -479,17 +510,19 @@ if LOCAL_RANK == 0:
         """根路径"""
         return {
             "service": "Multi-GPU Video Generation API",
-            "version": "2.0.0",
+            "version": "3.0.0",
             "status": "running",
             "config": {
                 "t5_cpu": MODEL_CONFIG["t5_cpu"],
                 "distributed_inference": WORLD_SIZE > 1,
-                "concurrent_tasks": BUSINESS_CONFIG["max_concurrent_tasks"]
+                "concurrent_tasks": BUSINESS_CONFIG["max_concurrent_tasks"],
+                "device_type": device_info.get("device_type", "unknown")
             },
             "endpoints": {
                 "docs": "/docs",
                 "health": "/health",
-                "metrics": "/metrics"
+                "metrics": "/metrics",
+                "device_info": "/device_info"
             }
         }
 
@@ -499,7 +532,7 @@ if LOCAL_RANK == 0:
         """启动服务器"""
         try:
             logger.info(f"Starting FastAPI server on {SERVER_CONFIG['host']}:{SERVER_CONFIG['port']}")
-            logger.info(f"Configuration: T5 CPU={MODEL_CONFIG['t5_cpu']}, Max concurrent={BUSINESS_CONFIG['max_concurrent_tasks']}")
+            logger.info(f"Configuration: Device={device_info.get('device_type', 'unknown')}, T5 CPU={MODEL_CONFIG['t5_cpu']}, Max concurrent={BUSINESS_CONFIG['max_concurrent_tasks']}")
             
             uvicorn.run(
                 app,
@@ -528,7 +561,7 @@ if LOCAL_RANK == 0:
 
 else:
     # 非主进程只参与分布式推理
-    logger.info(f"Rank {LOCAL_RANK} ready for distributed inference (T5 CPU: {t5_cpu_mode})")
+    logger.info(f"Rank {LOCAL_RANK} ready for distributed inference (Device: {device_info.get('device_type', 'unknown')}, T5 CPU: {t5_cpu_mode})")
     
     def signal_handler(sig, frame):
         logger.info(f"Rank {LOCAL_RANK} shutting down")
